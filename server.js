@@ -479,12 +479,18 @@ async function verifyInvoicePayment(req, res, account) {
     }
 
     // Verified: one transaction pays one invoice, and the plan starts now.
-    invoice.txHash = txHash.toLowerCase();
-    invoice.paidAt = Date.now();
-    invoice.status = "paid";
-    const paidUntil = payments.extendPaid(account);
-    await invoices.save();
-    await accounts.save();
+    // markPaid serializes against every other invoice mutation — if a second
+    // request verified this same invoice with the same receipt while this one
+    // was on the wire, it answers already-paid here and the plan is not
+    // extended twice. The invoice's paid state and the account's plan each
+    // commit inside their ledger's serialization, so neither can end up
+    // half-applied across a crash or a competing write.
+    const { already } = await invoices.markPaid(invoice.id, { txHash: txHash.toLowerCase(), paidAt: Date.now() });
+    if (already) {
+        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: payments.activePaidUntil(account), alreadyPaid: true, test: true });
+        return;
+    }
+    const paidUntil = await accounts.setPlan(account.id, payments.extendPaid);
     sendJson(res, 200, { status: "paid", tier: "paid", paidUntil, test: true });
 }
 

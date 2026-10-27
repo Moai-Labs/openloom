@@ -782,4 +782,248 @@ test("billing routes need an account", async () => {
   assert.equal((await request("GET", "/api/billing")).status, 200);
 });
 
+// --- concurrency: serialized persistence ------------------------------------
+// These pin the review findings: shared temporary filenames and unsynchronized
+// writes used to let overlapping operations corrupt accounts.json and
+// invoices.json, and a rejected upload used to delete every other upload's
+// staging file with the shared tmp directory.
+
+const { Accounts } = require("../lib/accounts");
+
+test("concurrent account operations persist one consistent store", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+
+  // 12 sign-ups, logins for those already made, and logouts, all fired at once.
+  const emails = Array.from({ length: 12 }, (_, i) => `concurrent-${i}@example.com`);
+  const jobs = emails.map((email) => ledger.create(email, "correct horse battery"));
+  const created = await Promise.all(jobs);
+  const tokens = created.map((made) => made.token);
+  // now logins and logouts over the live accounts, all at once
+  const overlapping = [
+    ...emails.slice(1).map((email) => ledger.login(email, "correct horse battery")),
+    ...tokens.slice(0, 4).map((token) => ledger.logout(token))
+  ];
+  const settled = await Promise.allSettled([...jobs, ...overlapping]);
+  for (const s of settled) assert.equal(s.status, "fulfilled", "no concurrent operation may fail: " + (s.reason && s.reason.message));
+
+  // A fresh instance reloads the same file: valid JSON, every account there.
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  for (const email of emails) {
+    assert.ok(reopened.data.accounts.some((a) => a.email === email), `${email} survived`);
+  }
+  // every session on disk still authenticates its account
+  const raw = fs.readFileSync(path.join(dir, "accounts.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  for (const token of tokens.slice(4)) {
+    assert.ok(await reopened.auth(token), "a live session still authenticates after the storm");
+  }
+  // and the logged-out ones no longer do
+  for (const token of tokens.slice(0, 4)) {
+    assert.equal(await reopened.auth(token), null);
+  }
+  // no temporary files were left behind
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("concurrent account operations survive a failing commit with state intact", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+  const made = await ledger.create("first@example.com", "correct horse battery");
+
+  // the next commits fail, as a full disk would
+  const realCommit = ledger.commit;
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const signup = await ledger.create("second@example.com", "correct horse battery").then(() => null, (err) => err);
+  assert.ok(signup, "the sign-up fails when its commit fails");
+  const logout = await ledger.logout(made.token).then(() => "changed", (err) => err);
+  assert.notEqual(logout, "changed", "the logout fails when its commit fails");
+
+  // memory rolled back to what is on disk, and the queue still works
+  assert.equal(ledger.data.accounts.length, 1, "the failed sign-up left no half-account");
+  ledger.commit = realCommit;
+  const third = await ledger.create("third@example.com", "correct horse battery");
+  assert.ok(third.token, "operations queued behind a failure still run");
+
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  assert.deepEqual(reopened.data.accounts.map((a) => a.email), ["first@example.com", "third@example.com"]);
+  assert.ok(await reopened.auth(made.token), "the failed logout did not drop the session on disk");
+});
+
+test("concurrent invoice creation and expiry persist every committed state", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  // two stale invoices to expire, then a storm of creations and expiries at once
+  const stale1 = await ledger.create("stale-account", Date.now() - 2 * payments.INVOICE_TTL_MS);
+  const stale2 = await ledger.create("stale-account", Date.now() - 2 * payments.INVOICE_TTL_MS);
+  const creations = Array.from({ length: 20 }, (_, i) => ledger.create(`account-${i % 3}`, Date.now() + i));
+  const expiries = Array.from({ length: 6 }, () => ledger.expireStale(Date.now()));
+  const settled = await Promise.allSettled([...creations, ...expiries]);
+  for (const s of settled) assert.equal(s.status, "fulfilled", "no concurrent invoice operation may fail: " + (s.reason && s.reason.message));
+
+  const created = (await Promise.all(creations)).map((i) => i.id);
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  const raw = fs.readFileSync(path.join(dir, "invoices.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  assert.equal(reopened.data.invoices.length, created.length + 2, "no invoice was lost across the restart");
+  for (const id of created) {
+    assert.ok(reopened.find(id), `invoice ${id} survived`);
+  }
+  // the two stale ones ended expired, exactly once, and nothing else moved
+  assert.equal(reopened.find(stale1.id).status, "expired");
+  assert.equal(reopened.find(stale2.id).status, "expired");
+  for (const id of created) {
+    assert.equal(reopened.find(id).status, "pending", "a fresh invoice is still pending");
+  }
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("a failing invoice commit rolls back and the queue keeps working", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  const realCommit = ledger.commit;
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const failed = await ledger.create("account-x").then(() => null, (err) => err);
+  assert.ok(failed, "creation fails when its commit fails");
+  assert.equal(ledger.data.invoices.length, 0, "the failed creation left no half-invoice");
+
+  ledger.commit = realCommit;
+  const ok = await ledger.create("account-x");
+  assert.ok(ok.id, "operations queued behind a failure still run");
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.data.invoices.length, 1);
+  assert.equal(reopened.find(ok.id).id, ok.id);
+});
+
+test("a valid upload survives concurrent empty and oversized uploads", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-store-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  await store.init();
+
+  const maxBytes = 16 * 1024;
+  const { PassThrough } = require("node:stream");
+
+  // A request whose body arrives in chunks with gaps, so it is still writing
+  // while the failures below finish — exactly the overlap that used to delete
+  // its staging file along with the shared tmp directory.
+  const payload = crypto.randomBytes(12 * 1024);
+  const validReq = new PassThrough();
+  (async () => {
+    for (let i = 0; i < payload.length; i += 2048) {
+      validReq.write(payload.subarray(i, i + 2048));
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    validReq.end();
+  })();
+
+  const emptyReq = new PassThrough();
+  emptyReq.end();
+
+  const bigReq = new PassThrough();
+  (async () => {
+    bigReq.write(Buffer.alloc(maxBytes)); // at the cap…
+    bigReq.write(Buffer.alloc(1024)); // …then over it: the transform rejects
+    bigReq.end();
+  })();
+
+  const [valid, empty, big] = await Promise.allSettled([
+    store.createFromStream(validReq, { maxBytes, contentType: "video/webm", filename: "ok.webm", accountId: "acc-1" }),
+    store.createFromStream(emptyReq, { maxBytes, contentType: "video/webm", filename: "empty.webm", accountId: "acc-1" }),
+    store.createFromStream(bigReq, { maxBytes, contentType: "video/webm", filename: "big.webm", accountId: "acc-1" })
+  ]);
+
+  // the failures failed for the right reasons
+  assert.equal(empty.status, "rejected");
+  assert.equal(empty.reason.status, 400, "the empty upload is refused as empty");
+  assert.equal(big.status, "rejected");
+  const { UploadTooLarge } = require("../lib/store");
+  assert.ok(big.reason instanceof UploadTooLarge, "the oversized upload is refused as too large");
+
+  // the valid one made it — and intact
+  assert.equal(valid.status, "fulfilled", "the valid upload must survive: " + (valid.reason && valid.reason.stack));
+  const { meta, manageToken } = valid.value;
+  assert.equal(meta.bytes, payload.length);
+  assert.deepEqual(fs.readFileSync(store.videoPath(meta.id)), payload, "the recording on disk is byte-identical");
+  const reMeta = await store.get(meta.id);
+  assert.equal(reMeta.accountId, "acc-1");
+  assert.ok(reMeta.tokenHash, "the manage token hash is recorded");
+  assert.notEqual(reMeta.tokenHash, manageToken, "only the hash is stored");
+
+  // the shared tmp directory is intact and holds no leftover staging files
+  assert.deepEqual(fs.readdirSync(path.join(dir, "tmp")), [], "no staging files were left behind");
+});
+
+test("two concurrent verifies of the same receipt extend the plan once", { timeout: 8000 }, async () => {
+  const acct = await makeAccount("race-payer@example.com");
+  const invoice = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  // a tx hash of this test's own — TX_HASH was already spent on another invoice
+  const raceHash = "0x" + "b7".repeat(32);
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+
+  // Both verifies wait on the (stubbed) network before either commits, so the
+  // serialization point is markPaid, not the HTTP handler: the stub holds
+  // every answer until both requests are in flight.
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  const slowFetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(payments.CHAIN_ID).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    await gate; // both requests are in flight before either returns
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = slowFetch;
+  // launch both, give them time to reach the stubbed chain, then release them
+  const pending = [
+    request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: raceHash }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+    }),
+    request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: raceHash }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+    })
+  ];
+  await new Promise((r) => setTimeout(r, 100));
+  openGate();
+  globalThis.fetch = realFetch;
+  const [first, second] = await Promise.allSettled(pending);
+
+  // both succeed, but the plan runs 30 days from now, not 60
+  assert.equal(first.status, "fulfilled");
+  assert.equal(second.status, "fulfilled");
+  const a = JSON.parse(first.value.body);
+  const b = JSON.parse(second.value.body);
+  assert.equal(a.status, "paid");
+  assert.equal(b.status, "paid");
+  const onePaidUntil = Math.max(a.paidUntil, b.paidUntil);
+  assert.ok(onePaidUntil < Date.now() + 30 * 24 * 60 * 60 * 1000 + 5000, "one payment, one 30-day extension");
+  assert.ok(onePaidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "and it is a full 30 days");
+  const oneWasIdempotent = a.alreadyPaid === true || b.alreadyPaid === true;
+  assert.ok(oneWasIdempotent, "the second verify reported the plan rather than paying twice");
+
+  // and the invoice ledger holds exactly one paid record for the transaction
+  const raw = fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8");
+  const stored = JSON.parse(raw).invoices.filter((i) => i.txHash === raceHash);
+  assert.equal(stored.length, 1, "the transaction is recorded exactly once");
+  assert.equal(stored[0].status, "paid");
+});
+
 after(() => new Promise((resolve) => server.close(() => resolve())));
