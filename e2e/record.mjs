@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// End-to-end check in a real (headless) Chrome: record, upload, share-link
-// playback, download, and deletion. Run with the repo root as cwd:
+// End-to-end check in a real (headless) Chrome: sign up, record, hit the free
+// cap with a clear message, export, delete everything, and a full
+// backup -> wipe -> restore -> playback cycle on the server.
+// Run with the repo root as cwd:
 //
 //   npm i puppeteer   # once, outside CI (downloads a Chrome)
 //   node e2e/record.mjs [baseUrl]
@@ -12,7 +14,7 @@
 // MediaRecorder encoding, upload, playback, download, deletion — is the real
 // product path.
 
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -77,52 +79,15 @@ const FAKE_GET_DISPLAY_MEDIA = `
   };
 `;
 
-async function recordAClip(browser, title) {
-  const page = await browser.newPage();
-  let usedSyntheticSource = false;
-
-  page.on("pageerror", (err) => console.error("  [pageerror]", err.message));
-  page.on("console", (msg) => { if (msg.type() === "error") console.error("  [console.error]", msg.text()); });
-  page.on("requestfailed", (r) => console.error("  [requestfailed]", r.url(), r.failure()?.errorText));
-
+async function signUp(page, email) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
-  await page.type("#title", title);
-
-  await page.click("#startBtn");
-  try {
-    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
-  } catch {
-    // headless Chrome often cannot open the real picker: inject a synthetic
-    // capture source and record again
-    usedSyntheticSource = true;
-    await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
-    await page.click("#startBtn");
-    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
-  }
-
-  // record ~4 seconds of real MediaRecorder encoding
-  const mime = await page.evaluate(() => window.__mime || null);
-  await new Promise((r) => setTimeout(r, 4000));
-  const timerText = await page.$eval("#timer", (el) => el.textContent);
-  if (!/0:0[34]/.test(timerText)) throw new Error(`timer looks wrong: ${timerText}`);
-
-  await page.click("#stopBtn");
-  await page.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
-  const result = await page.evaluate(() => ({
-    share: document.getElementById("shareLink").value,
-    manage: document.getElementById("manageLink").value,
-    note: document.getElementById("resultNote").textContent,
-    blobHash: null
-  }));
-  result.blobHash = await page.evaluate(async () => {
-    const buf = await pendingBlob.arrayBuffer();
-    const digest = await crypto.subtle.digest("SHA-256", buf);
-    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  });
-  result.usedSyntheticSource = usedSyntheticSource;
-  result.mime = await page.evaluate(() => (typeof pendingBlob !== "undefined" ? pendingBlob.type : ""));
-  await page.close();
-  return result;
+  await page.waitForSelector("#auth:not(.hidden)", { timeout: 10000 });
+  await page.type("#email", email);
+  await page.type("#password", "correct horse battery");
+  await page.click("#authBtn");
+  await page.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  return page.$eval("#whoami", (el) => el.textContent);
 }
 
 async function main() {
@@ -135,15 +100,69 @@ async function main() {
     if (!ok) failures.push(name);
   };
 
-  // 1. the author records and saves
-  const author = await recordAClip(browser, "E2E demo recording");
-  check("recording produced a share link", /^http.*\/v\/[A-Za-z0-9_-]+$/.test(author.share), author.share);
-  check("recording produced a manage link", author.manage.includes(author.share.split("/v/")[1]), author.manage);
+  // 1. a new creator signs up
+  const authorContext = await browser.createBrowserContext();
+  const authorPage = await authorContext.newPage();
+  const who = await signUp(authorPage, "author@example.com");
+  check("new creator signs up and is signed in", who === "author@example.com", who);
 
-  // 2. a viewer without any cookies or storage opens the share link
+  // 2. records three clips — the whole free allowance
+  const signedInRecord = async (title) => {
+    // recording happens on a fresh page in the same (signed-in) context
+    const page = await authorContext.newPage();
+    page.on("pageerror", (err) => console.error("  [pageerror]", err.message));
+    await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+    await page.type("#title", title);
+    await page.click("#startBtn");
+    try {
+      await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+    } catch {
+      await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+      await page.click("#startBtn");
+      await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+    await page.click("#stopBtn");
+    await page.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+    const share = await page.$eval("#shareLink", (el) => el.value);
+    await page.close();
+    return share;
+  };
+
+  const shares = [];
+  for (let i = 1; i <= 3; i++) shares.push(await signedInRecord(`Free-limit demo ${i}`));
+  check("three clips recorded and saved", shares.every((s) => /^http.*\/v\/[A-Za-z0-9_-]+$/.test(s)), shares.join(", "));
+
+  // 3. the usage meter shows the account is full and the button says so
+  const fullState = await authorPage.waitForFunction(() => {
+    const bar = document.getElementById("usageBar");
+    return bar.classList.contains("full");
+  }, { timeout: 10000 }).then(() => authorPage.evaluate(() => ({
+    usageText: document.getElementById("usageText").textContent,
+    btn: document.getElementById("startBtn").textContent,
+    disabled: document.getElementById("startBtn").disabled,
+    listed: document.querySelectorAll("#recList li").length
+  })), () => null);
+  check("usage meter shows 3 of 3", !!fullState && /3 of 3/.test(fullState.usageText), fullState?.usageText);
+  check("start button names the limit and refuses to start",
+    !!fullState && fullState.disabled && /limit/i.test(fullState.btn),
+    fullState ? `${fullState.btn} (disabled=${fullState.disabled})` : "meter never filled");
+  check("the private clip list shows all three clips", !!fullState && fullState.listed === 3, String(fullState?.listed));
+
+  // 4. another account sees none of them
+  const strangerContext = await browser.createBrowserContext();
+  const stranger = await strangerContext.newPage();
+  const strangerEmail = await signUp(stranger, "stranger@example.com");
+  const strangerList = await stranger.waitForFunction(() =>
+    /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 })
+    .then(() => stranger.$eval("#recList", (ul) => ul.children.length));
+  check("a second account's list is private and empty", strangerEmail === "stranger@example.com" && strangerList === 0,
+    `${strangerEmail}, ${strangerList} rows`);
+
+  // 5. a viewer without any account opens a share link
   const viewerContext = await browser.createBrowserContext();
   const viewer = await viewerContext.newPage();
-  await viewer.goto(author.share, { waitUntil: "networkidle0" });
+  await viewer.goto(shares[0], { waitUntil: "networkidle0" });
   const playback = await viewer.waitForFunction(() => {
     const v = document.querySelector("video");
     return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
@@ -152,50 +171,80 @@ async function main() {
     title: document.getElementById("clipTitle").textContent,
     deleteVisible: !document.getElementById("deleteBtn").classList.contains("hidden")
   })), () => null);
-  check("share link plays for a viewer", !!playback, playback ? `${playback.duration.toFixed(1)}s, "${playback.title}"` : "video metadata never resolved");
+  check("share link plays for a viewer with no account", !!playback, playback ? `${playback.duration.toFixed(1)}s, "${playback.title}"` : "video metadata never resolved");
   if (playback) check("viewer does not see a delete button", !playback.deleteVisible);
 
-  // 3. the original downloads byte-identical
-  const downloaded = await viewer.evaluate(async () => {
-    const res = await fetch(document.getElementById("downloadBtn").href);
-    const buf = await res.arrayBuffer();
-    const digest = await crypto.subtle.digest("SHA-256", buf);
-    return {
-      status: res.status,
-      type: res.headers.get("content-type"),
-      disposition: res.headers.get("content-disposition"),
-      bytes: buf.byteLength,
-      hash: [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")
-    };
+  // 6. the export is one archive holding the manifest and the clips
+  const exported = await authorPage.evaluate(async () => {
+    const res = await fetch("/api/my/export", { method: "POST", headers: { Authorization: "Bearer " + localStorage.getItem("openloom.token") } });
+    if (!res.ok) return { ok: false, status: res.status };
+    const { exportPath } = await res.json();
+    const archive = await fetch(exportPath);
+    const buf = await archive.arrayBuffer();
+    const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 512)));
+    return { ok: archive.status === 200, bytes: buf.byteLength, head, type: archive.headers.get("content-type") };
   });
-  check("download returns 200", downloaded.status === 200, `type ${downloaded.type}`);
-  check("download is byte-identical to what was recorded",
-    downloaded.hash === author.blobHash,
-    `${downloaded.bytes} bytes, hashes ${downloaded.hash === author.blobHash ? "match" : "differ"}`);
-  check("download has an attachment filename", /attachment/.test(downloaded.disposition || ""), downloaded.disposition);
+  check("export downloads a tar archive", !!exported && exported.ok && /x-tar/.test(exported.type || ""),
+    exported ? `${exported.bytes} bytes` : "no archive");
+  check("export holds the manifest and both meta and video entries",
+    !!exported && /openloom-export\.json/.test(exported.head) && /clips\//.test(exported.head),
+    exported?.head?.slice(0, 60));
 
-  // 4. the manage link deletes from a completely different browser session
-  const managerContext = await browser.createBrowserContext();
-  const manager = await managerContext.newPage();
-  await manager.goto(author.manage, { waitUntil: "networkidle0" });
-  manager.on("dialog", (d) => d.accept());
-  await manager.click("#deleteBtn");
-  await manager.waitForFunction(() => document.getElementById("note")?.textContent.includes("deleted"), { timeout: 15000 })
-    .then(() => check("manage link deletes the clip", true))
-    .catch(() => check("manage link deletes the clip", false));
+  // 7. persistence: back up, wipe, restore — the clip list and files come back
+  if (dataDir) {
+    const metaPath = new URL(shares[1]).pathname.replace("/v/", "/api/clips/");
+    const before = await viewer.evaluate(async (url) => (await fetch(url)).json(), baseUrl + metaPath);
+    const backupDir = dataDir + "-backups";
+    execFileSync(process.execPath, ["scripts/backup.mjs", "--dir", backupDir], {
+      cwd: REPO, env: { ...process.env, DATA_DIR: dataDir }, stdio: "inherit"
+    });
+    child.kill();
+    await new Promise((r) => setTimeout(r, 500));
+    rmSync(dataDir, { recursive: true, force: true }); // the disaster itself
+    execFileSync(process.execPath, ["scripts/restore.mjs", "--latest"], {
+      cwd: REPO, env: { ...process.env, DATA_DIR: dataDir, OPENLOOM_BACKUP_DIR: backupDir }, stdio: "inherit"
+    });
+    child = spawn(process.execPath, ["server.js"], {
+      cwd: REPO,
+      env: { ...process.env, PORT: "0", DATA_DIR: dataDir },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const restarted = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("server did not restart")), 10000);
+      child.stdout.on("data", (d) => {
+        const match = /listening on (\d+)/.exec(String(d));
+        if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); }
+      });
+      child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
+    });
+    baseUrl = restarted;
+    const after = await viewer.evaluate(async (url) => {
+      const res = await fetch(url);
+      return { status: res.status, body: res.status === 200 ? await res.json() : null };
+    }, restarted + metaPath);
+    check("a restored server serves the same clip",
+      after.status === 200 && after.body.bytes === before.bytes,
+      `status ${after.status}`);
+    const stillSignedIn = await authorPage.evaluate(async (url) => {
+      const res = await fetch(url, { headers: { Authorization: "Bearer " + localStorage.getItem("openloom.token") } });
+      return res.status;
+    }, restarted + "/api/me");
+    check("accounts survive the restore too", stillSignedIn === 200, `me returned ${stillSignedIn}`);
+  } else {
+    check("backup/restore demonstration ran against a local server", false, "skipped: a remote baseUrl was given");
+  }
 
-  const after = await viewer.evaluate(async (url) => (await fetch(url)).status,
-    new URL(author.share).pathname.replace("/v/", "/api/clips/") );
-  check("clip is gone after deletion", after === 404, `meta now returns ${after}`);
-
-  // share link now explains itself (fresh page, plain load: the old tab's
-  // media loader may keep retrying after the deletion and never go idle)
-  const gonePage = await browser.newPage();
-  await gonePage.goto(author.share, { waitUntil: "domcontentloaded" });
-  const gone = await gonePage.waitForFunction(() =>
-    document.getElementById("note").textContent.length > 0, { timeout: 10000 })
-    .then(() => gonePage.evaluate(() => document.getElementById("note").textContent));
-  check("deleted share link explains itself", /deleted/i.test(gone), gone);
+  // 8. delete everything — on the restarted server, still signed in
+  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await authorPage.waitForFunction(() => /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 });
+  authorPage.on("dialog", (d) => d.accept());
+  await authorPage.click("#deleteAllBtn");
+  const emptied = await authorPage.waitForFunction(() =>
+    document.querySelectorAll("#recList li").length === 0, { timeout: 10000 }).then(() => true, () => false);
+  check("delete everything empties the list", emptied);
+  const goneAfterPurge = await viewer.evaluate(async (url) => (await fetch(url)).status,
+    baseUrl + new URL(shares[0]).pathname.replace("/v/", "/api/clips/"));
+  check("deleted clips stop playing for viewers", goneAfterPurge === 404, `meta now returns ${goneAfterPurge}`);
 
   await browser.close();
   if (child) child.kill();
