@@ -92,3 +92,23 @@ dependencies — Node stdlib only.
 - Accounts are a single JSON file; hundreds of thousands of users would need
   a database.
 - Restore expects the server to be stopped (the script moves files).
+
+## Session 3 (2026-10-27, ~17:20 UTC)
+
+Delivery session. The previous session's queued push had not landed (no
+post-18 ref on origin, no CI verdict), so this session re-verified and
+re-queued:
+
+- Merged origin/main (6646234: CI now builds to the app's fly registry;
+  deploy.json image field changed by the platform). Merge is clean;
+  `volume_gb: 5` and `DATA_DIR=/data` survive alongside it.
+- `npm test`: 27/27 pass on the merged head.
+- E2E re-run NOT possible on this machine: fresh container, no Chrome system
+  libraries, no root to install them. The merged diff contains no product
+  code, so the previous session's full green E2E run on identical code stands.
+- Committed the e2e toolchain as devDependencies (puppeteer@23, yauzl) plus
+  package-lock, so the E2E is installable from the repo on any machine with
+  Chrome's system libs.
+- Push queued via request_push. Remaining: CI verdict + preview link (next
+  session's first job), and the open platform question on the real volume
+  mount path for DATA_DIR.
