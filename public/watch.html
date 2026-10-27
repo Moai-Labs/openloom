@@ -117,6 +117,19 @@ async function main() {
   $("downloadBtn").href = "/api/clips/" + encodeURIComponent(clipId) + "/file?download=1";
   $("downloadBtn").setAttribute("download", meta.filename || "recording.webm");
 
+  // If the stream dies underneath a viewer (the author deleted the clip,
+  // say), say what happened instead of leaving a stuck player.
+  $("player").addEventListener("error", async () => {
+    try {
+      const res = await fetch("/api/clips/" + encodeURIComponent(clipId));
+      if (res.status === 404) {
+        const note = $("note");
+        note.className = "note";
+        note.textContent = "This clip is no longer available — it was deleted while you were watching.";
+      }
+    } catch { /* connection trouble; leave the player's own error UI */ }
+  });
+
   const token = keyParam || localToken(clipId);
   if (token) {
     const del = $("deleteBtn");

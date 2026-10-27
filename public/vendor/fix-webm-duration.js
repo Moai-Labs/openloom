@@ -23,6 +23,8 @@
    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
    THE SOFTWARE.
 */
+(function (name, definition) {
+    if (typeof define === 'function' && define.amd) { // RequireJS / AMD
         define(definition);
     } else if (typeof module !== 'undefined' && module.exports) { // CommonJS / Node.js
         module.exports = definition();

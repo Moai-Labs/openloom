@@ -202,12 +202,18 @@ async function deleteClip(req, res, id) {
 // Pages and routing
 
 const publicDir = path.join(__dirname, "public");
-const pages = new Map(); // name -> { body, contentHash }
+const pages = new Map(); // name -> { body, type }
+const staticFiles = new Map(); // url path -> { file, type }
 const pagePolicy = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; media-src 'self'";
 
 function loadPage(name, type) {
     const body = fs.readFileSync(path.join(publicDir, name));
     pages.set(name, { body, type });
+}
+
+// Third-party scripts live in public/vendor; only plain names are served.
+function loadStatic(urlPath, name, type) {
+    staticFiles.set(urlPath, { file: path.join(publicDir, "vendor", name), type });
 }
 
 function sendPage(res, name) {
@@ -250,6 +256,22 @@ async function handle(req, res) {
 
     if (u.pathname === "/healthz") {
         sendJson(res, 200, { ok: true });
+        return;
+    }
+
+    if (req.method === "GET" && staticFiles.has(u.pathname)) {
+        const entry = staticFiles.get(u.pathname);
+        try {
+            const body = fs.readFileSync(entry.file);
+            res.writeHead(200, {
+                "content-type": entry.type,
+                "content-length": body.length,
+                "cache-control": "public, max-age=3600"
+            });
+            res.end(body);
+        } catch {
+            sendError(res, 404, "not found");
+        }
         return;
     }
 
@@ -302,7 +324,8 @@ server.on("clientError", (err, socket) => {
     await store.init();
     loadPage("recorder.html", "text/html; charset=utf-8");
     loadPage("watch.html", "text/html; charset=utf-8");
-    server.listen(port, () => console.log(`listening on ${port}`));
+    loadStatic("/vendor/fix-webm-duration.js", "fix-webm-duration.js", "application/javascript; charset=utf-8");
+    server.listen(port, () => console.log(`listening on ${server.address().port}`));
 })().catch((err) => {
     console.error("failed to start:", err);
     process.exit(1);
