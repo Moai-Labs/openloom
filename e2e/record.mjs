@@ -3,6 +3,7 @@
 // playback, download, and deletion. Run with the repo root as cwd:
 //
 //   npm i puppeteer   # once, outside CI (downloads a Chrome)
+//   npm i yauzl       # needed where no `unzip` exists, to extract it
 //   node e2e/record.mjs [baseUrl]
 //
 // Without a baseUrl it starts the server itself on an ephemeral port with a
