@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenLoom — watch</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --text: #e8eaf0; --muted: #9aa3b2; --accent: #5b8cff; --danger: #e0574f; --ok: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; gap: .6rem;
+    padding: 1rem 1.25rem; border-bottom: 1px solid var(--line);
+  }
+  .logo { font-weight: 700; font-size: 1.15rem; text-decoration: none; color: var(--text); }
+  .logo span { color: var(--accent); }
+  main { max-width: 56rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .3rem; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: .88rem; margin-bottom: 1rem; }
+  .actions { display: flex; gap: .6rem; flex-wrap: wrap; margin: 1rem 0; }
+  button {
+    appearance: none; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
+    font-size: .95rem; font-weight: 600; padding: .6rem 1.1rem; color: #fff;
+  }
+  a.button { text-decoration: none; display: inline-block; }
+  .primary { background: var(--accent); }
+  .primary:hover { background: #3f6fe8; }
+  .danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  .danger:hover { background: rgba(224, 87, 79, .12); }
+  video {
+    width: 100%; max-height: 70vh; border-radius: 12px; border: 1px solid var(--line);
+    background: #000; display: block;
+  }
+  .note { margin-top: 1rem; font-size: .95rem; }
+  .error { color: var(--danger); }
+  .ok { color: var(--ok); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 1.4rem; }
+  footer { text-align: center; color: var(--muted); font-size: .8rem; padding: 1rem; }
+</style>
+</head>
+<body>
+<header><a class="logo" href="/">Open<span>Loom</span></a></header>
+<main>
+  <section class="card" id="viewer">
+    <h1 id="clipTitle">Loading…</h1>
+    <p class="meta" id="clipMeta"></p>
+    <video id="player" controls playsinline preload="metadata"></video>
+    <div class="actions" id="actions">
+      <a class="button primary" id="downloadBtn" href="#" download>Download the original</a>
+      <button class="danger hidden" id="deleteBtn">Delete this clip</button>
+    </div>
+    <p class="note" id="note"></p>
+  </section>
+</main>
+<footer>Shared with OpenLoom — anyone with the link can watch.</footer>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const STORE_KEY = "openloom.recordings";
+
+const clipId = location.pathname.split("/").filter(Boolean)[1] || "";
+const params = new URLSearchParams(location.search);
+const keyParam = params.get("k");
+
+function localToken(id) {
+  try {
+    const list = JSON.parse(window.localStorage.getItem(STORE_KEY) || "[]") || [];
+    const rec = list.find((r) => r.id === id);
+    return rec ? rec.token : null;
+  } catch { return null; }
+}
+
+function forgetLocal(id) {
+  try {
+    const list = (JSON.parse(window.localStorage.getItem(STORE_KEY) || "[]") || [])
+      .filter((r) => r.id !== id);
+    window.localStorage.setItem(STORE_KEY, JSON.stringify(list));
+  } catch { /* ignore */ }
+}
+
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
+}
+
+async function main() {
+  if (!/^[A-Za-z0-9_-]{10,64}$/.test(clipId)) {
+    return notFound("That link does not point at a clip.");
+  }
+
+  let meta;
+  try {
+    const res = await fetch("/api/clips/" + encodeURIComponent(clipId));
+    if (res.status === 404) return notFound("This clip does not exist, or it has been deleted by its author.");
+    if (!res.ok) return notFound("Something went wrong while loading this clip.");
+    meta = await res.json();
+  } catch {
+    return notFound("Could not reach the server. Check your connection and reload.");
+  }
+
+  document.title = (meta.title || "Recording") + " — OpenLoom";
+  $("clipTitle").textContent = meta.title || "Untitled recording";
+  $("clipMeta").textContent =
+    new Date(meta.createdAt).toLocaleString() + " · " + fmtBytes(meta.bytes) +
+    (meta.durationMs ? " · " + Math.round(meta.durationMs / 1000) + "s" : "");
+
+  $("player").src = "/api/clips/" + encodeURIComponent(clipId) + "/file";
+  $("downloadBtn").href = "/api/clips/" + encodeURIComponent(clipId) + "/file?download=1";
+  $("downloadBtn").setAttribute("download", meta.filename || "recording.webm");
+
+  // If the stream dies underneath a viewer (the author deleted the clip,
+  // say), say what happened instead of leaving a stuck player.
+  $("player").addEventListener("error", async () => {
+    try {
+      const res = await fetch("/api/clips/" + encodeURIComponent(clipId));
+      if (res.status === 404) {
+        const note = $("note");
+        note.className = "note";
+        note.textContent = "This clip is no longer available — it was deleted while you were watching.";
+      }
+    } catch { /* connection trouble; leave the player's own error UI */ }
+  });
+
+  const token = keyParam || localToken(clipId);
+  if (token) {
+    const del = $("deleteBtn");
+    del.classList.remove("hidden");
+    del.onclick = () => deleteClip(token);
+    $("note").textContent = "You have the manage key for this clip: deleting removes it for everyone.";
+  }
+}
+
+function notFound(message) {
+  $("clipTitle").textContent = "Clip unavailable";
+  $("clipMeta").textContent = "";
+  $("player").remove();
+  $("actions").remove();
+  const note = $("note");
+  note.textContent = message;
+  note.className = "note error";
+}
+
+async function deleteClip(token) {
+  const confirmed = confirm("Delete this clip? Everyone with the link loses access.");
+  if (!confirmed) return;
+  const btn = $("deleteBtn");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/clips/" + encodeURIComponent(clipId), {
+      method: "DELETE",
+      headers: { Authorization: "Bearer " + token }
+    });
+    if (res.status === 204) {
+      forgetLocal(clipId);
+      $("player").remove();
+      $("actions").remove();
+      $("clipTitle").textContent = "Clip unavailable";
+      $("clipMeta").textContent = "";
+      const note = $("note");
+      note.className = "note ok";
+      note.textContent = "This clip has been deleted.";
+    } else if (res.status === 403) {
+      $("note").className = "note error";
+      $("note").textContent = "That key does not manage this clip. Ask the author for their manage link.";
+      btn.disabled = false;
+    } else {
+      $("note").className = "note error";
+      $("note").textContent = "Deletion failed (" + res.status + "). Try again.";
+      btn.disabled = false;
+    }
+  } catch {
+    $("note").className = "note error";
+    $("note").textContent = "Deletion failed (network error). Try again.";
+    btn.disabled = false;
+  }
+}
+
+main();
+</script>
+</body>
+</html>

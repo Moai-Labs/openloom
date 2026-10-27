@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenLoom — record and share</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --text: #e8eaf0; --muted: #9aa3b2; --accent: #5b8cff; --accent-dark: #3f6fe8;
+    --danger: #e0574f; --ok: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; gap: .6rem;
+    padding: 1rem 1.25rem; border-bottom: 1px solid var(--line);
+  }
+  .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: .01em; text-decoration: none; color: var(--text); }
+  .logo span { color: var(--accent); }
+  header .tag { color: var(--muted); font-size: .85rem; }
+  header .spacer { margin-left: auto; }
+  header .whoami { color: var(--muted); font-size: .85rem; }
+  header a.plain { color: var(--accent); text-decoration: none; font-size: .85rem; cursor: pointer; }
+  header a.plain:hover { text-decoration: underline; }
+  main { max-width: 42rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 1.4rem; margin-bottom: 1.25rem;
+  }
+  h1 { font-size: 1.5rem; margin: 0 0 .35rem; }
+  .sub { color: var(--muted); margin: 0 0 1.2rem; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3rem; }
+  input[type="text"], input[type="email"], input[type="password"] {
+    width: 100%; padding: .6rem .75rem; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); font-size: 1rem; margin-bottom: 1rem;
+  }
+  button {
+    appearance: none; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
+    font-size: 1rem; font-weight: 600; padding: .65rem 1.2rem; color: #fff;
+  }
+  .primary { background: var(--accent); }
+  .primary:hover { background: var(--accent-dark); }
+  .primary:disabled { opacity: .5; cursor: default; }
+  .danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  .danger:hover { background: rgba(224, 87, 79, .12); }
+  .ghost { background: transparent; border-color: var(--line); color: var(--text); font-weight: 500; }
+  .ghost:hover { border-color: var(--muted); }
+  .status { margin-top: 1rem; color: var(--muted); font-size: .95rem; }
+  .status.error { color: var(--danger); }
+  .status.ok { color: var(--ok); }
+  .usage { display: flex; align-items: center; gap: .6rem; margin: 0 0 1rem; font-size: .85rem; color: var(--muted); }
+  .meter { flex: 1; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  .meter > div.full { background: var(--danger); }
+  .timer { font-variant-numeric: tabular-nums; font-size: 1.4rem; font-weight: 700; }
+  .recdot { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; background: var(--danger); margin-right: .45rem; animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .links { margin-top: 1rem; display: grid; gap: .6rem; }
+  .linkrow { display: flex; gap: .5rem; align-items: center; }
+  .linkrow input {
+    flex: 1; margin: 0; font-family: ui-monospace, monospace; font-size: .85rem; padding: .5rem .6rem;
+  }
+  .linkrow button { padding: .5rem .9rem; font-size: .85rem; }
+  .hint { font-size: .8rem; color: var(--muted); }
+  .progress { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; margin: .8rem 0 .3rem; }
+  .progress > div { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  video.preview { width: 100%; border-radius: 10px; border: 1px solid var(--line); margin-top: 1rem; background: #000; }
+  ul.recordings { list-style: none; margin: 0; padding: 0; }
+  ul.recordings li {
+    display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+    padding: .7rem 0; border-bottom: 1px solid var(--line); font-size: .92rem;
+  }
+  ul.recordings li:last-child { border-bottom: none; }
+  .rtitle { font-weight: 600; }
+  .rmeta { color: var(--muted); font-size: .8rem; }
+  ul.recordings a { color: var(--accent); text-decoration: none; }
+  ul.recordings a:hover { text-decoration: underline; }
+  ul.recordings .del { margin-left: auto; }
+  .empty { color: var(--muted); font-size: .9rem; }
+  .hidden { display: none !important; }
+  .authswitch { font-size: .85rem; color: var(--muted); }
+  .authswitch a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .bulk { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
+  .bulk button { font-size: .85rem; padding: .5rem .9rem; }
+  footer { text-align: center; color: var(--muted); font-size: .8rem; padding: 1rem; }
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="/">Open<span>Loom</span></a>
+  <div class="tag">record your screen, share a link — no account needed to watch</div>
+  <div class="spacer"></div>
+  <span class="whoami hidden" id="whoami"></span>
+  <a class="plain" id="signOutLink">Sign out</a>
+  <a class="plain" id="signInLink">Sign in</a>
+</header>
+<main>
+  <section class="card hidden" id="auth">
+    <h1 id="authTitle" style="font-size:1.1rem">Sign up — it's free</h1>
+    <p class="sub" id="authSub">An account keeps your clip list private to you. Watching a share link never needs one.</p>
+    <label for="email">Email</label>
+    <input type="email" id="email" maxlength="200" autocomplete="email">
+    <label for="password">Password (8+ characters)</label>
+    <input type="password" id="password" maxlength="200" autocomplete="current-password">
+    <button class="primary" id="authBtn">Create account</button>
+    <p class="status" id="authStatus"></p>
+    <p class="authswitch" id="authSwitch">Already recording here? <a id="authToggle">Sign in</a></p>
+  </section>
+
+  <section class="card" id="studio">
+    <h1>Record your screen</h1>
+    <p class="sub">Desktop Chrome. You pick the screen, window or tab; your microphone is added when you allow it.</p>
+
+    <div class="usage" id="usage">
+      <span id="usageText"></span>
+      <div class="meter"><div id="usageBar"></div></div>
+    </div>
+
+    <div id="setup">
+      <label for="title">Title (optional)</label>
+      <input type="text" id="title" maxlength="120" placeholder="Weekly demo — sprint 14" autocomplete="off">
+      <button class="primary" id="startBtn">Start recording</button>
+      <p class="status" id="setupStatus">Everything stays in your browser until you press stop.</p>
+    </div>
+
+    <div id="recording" class="hidden">
+      <p><span class="recdot"></span><span class="timer" id="timer">0:00</span>
+         <span class="rmeta" id="sizeNote"></span></p>
+      <button class="danger" id="stopBtn">Stop and save</button>
+      <p class="status">Click “Stop sharing” in Chrome’s bar and the recording saves too.</p>
+    </div>
+
+    <div id="saving" class="hidden">
+      <p class="status">Saving… <span id="pct"></span></p>
+      <div class="progress"><div id="bar"></div></div>
+    </div>
+
+    <div id="result" class="hidden">
+      <p class="status ok" id="resultNote"></p>
+      <div class="links">
+        <div class="linkrow">
+          <input readonly id="shareLink" aria-label="Share link">
+          <button class="ghost" data-copy="shareLink">Copy</button>
+        </div>
+        <div class="linkrow">
+          <input readonly id="manageLink" aria-label="Manage link">
+          <button class="ghost" data-copy="manageLink">Copy</button>
+        </div>
+      </div>
+      <p class="hint">The share link plays for anyone. The manage link also allows deleting the clip — keep it, it works even signed out.</p>
+      <p>
+        <a id="openShare" href="#"><button class="primary">Open the share page</button></a>
+        <button class="ghost" id="againBtn">Record another</button>
+      </p>
+    </div>
+
+    <div id="failed" class="hidden">
+      <p class="status error" id="failNote"></p>
+      <p>
+        <button class="primary" id="retryBtn">Try saving again</button>
+        <button class="ghost" id="localBtn">Download a copy instead</button>
+        <button class="ghost" id="discardBtn">Discard</button>
+      </p>
+    </div>
+
+    <video id="preview" class="preview hidden" controls playsinline></video>
+  </section>
+
+  <section class="card" id="clipsCard">
+    <h1 style="font-size:1.1rem">Your clips</h1>
+    <p class="sub">Private to your account. Share links stay open to anyone you send them to.</p>
+    <ul class="recordings" id="recList"></ul>
+    <p class="empty" id="recEmpty">Nothing yet. Your first recording appears here with its links.</p>
+    <div class="bulk" id="bulkActions">
+      <button class="ghost" id="exportBtn">Export everything (.tar)</button>
+      <button class="danger" id="deleteAllBtn">Delete everything</button>
+    </div>
+    <p class="hint"><a href="#" id="deleteAccountLink" style="color:var(--muted)">Delete your account</a> — removes the account and every clip.</p>
+  </section>
+
+  <section class="card hidden" id="deviceCard">
+    <h1 style="font-size:1.1rem">Recorded on this device</h1>
+    <p class="sub">Made before you signed in on this browser — saved in this browser only.</p>
+    <ul class="recordings" id="deviceList"></ul>
+    <p class="empty" id="deviceEmpty">Nothing here.</p>
+  </section>
+</main>
+<footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
+
+<script src="/vendor/fix-webm-duration.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const STORE_KEY = "openloom.recordings";
+const TOKEN_KEY = "openloom.token";
+const EMAIL_KEY = "openloom.email";
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
+
+const MIME_CANDIDATES = [
+  "video/webm;codecs=vp9,opus",
+  "video/webm;codecs=vp8,opus",
+  "video/webm",
+  "video/mp4"
+];
+
+// --- state ---------------------------------------------------------------
+
+let limits = { maxClips: 3, maxDurationMs: 300000, maxClipBytes: 104857600 };
+let recorder = null;
+let recordingStream = null;
+let chunks = [];
+let recordStart = 0;
+let timerHandle = 0;
+let pendingBlob = null;
+let pendingDurationMs = 0;
+let pendingTitle = "";
+let uploadXhr = null;
+let autoStopped = false;
+
+// --- tiny helpers ---------------------------------------------------------
+
+function storage(key, fallback) {
+  try { return window.localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function storageSet(key, value) {
+  try { window.localStorage.setItem(key, value); } catch { /* private mode etc. */ }
+}
+function storageRemove(key) {
+  try { window.localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+function token() { return storage(TOKEN_KEY, null); }
+function signedIn() { return !!token(); }
+
+function loadRecordings() {
+  try { return JSON.parse(storage(STORE_KEY, "[]")) || []; } catch { return []; }
+}
+function saveRecordings(list) {
+  storageSet(STORE_KEY, JSON.stringify(list.slice(0, 50)));
+}
+
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
+}
+function fmtClock(ms) {
+  const s = Math.floor(ms / 1000);
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function show(section) {
+  for (const id of ["setup", "recording", "saving", "result", "failed"]) {
+    $(id).classList.toggle("hidden", id !== section);
+  }
+}
+
+function setStatus(id, text, kind) {
+  const el = $(id);
+  el.textContent = text;
+  el.classList.toggle("error", kind === "error");
+  el.classList.toggle("ok", kind === "ok");
+}
+
+function pickMime() {
+  if (typeof MediaRecorder === "undefined") return null;
+  return MIME_CANDIDATES.find((t) => MediaRecorder.isTypeSupported(t)) || null;
+}
+
+// --- account --------------------------------------------------------------
+
+async function refreshAccount() {
+  const signed = signedIn();
+  $("signInLink").classList.toggle("hidden", signed);
+  $("signOutLink").classList.toggle("hidden", !signed);
+  $("auth").classList.toggle("hidden", signed || authCardPinned);
+  $("clipsCard").classList.toggle("hidden", !signed);
+  $("deviceCard").classList.toggle("hidden", signed || loadRecordings().length === 0);
+  $("whoami").classList.toggle("hidden", !signed);
+  if (signed) {
+    $("whoami").textContent = storage(EMAIL_KEY, "");
+    $("authStatus").textContent = "";
+    try {
+      const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+      if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+      const data = await res.json();
+      renderUsage(data.usage, data.limits);
+      if (data.limits) limits = data.limits;
+      await renderServerClips();
+    } catch {
+      renderUsage(null, null);
+    }
+  } else {
+    renderUsage(null, null);
+    renderDeviceRecordings();
+  }
+}
+
+let authCardPinned = false;
+
+function renderUsage(usage, serverLimits) {
+  if (serverLimits) limits = serverLimits;
+  const cap = limits.maxClips;
+  const used = usage ? usage.clips : 0;
+  const full = used >= cap;
+  $("usageText").textContent = signedIn()
+    ? `Free plan — ${used} of ${cap} clips`
+    : `Free plan — ${cap} clips, up to ${Math.round(limits.maxDurationMs / 60000)} minutes and ${fmtBytes(limits.maxClipBytes)} each`;
+  const bar = $("usageBar");
+  bar.style.width = Math.min(100, (used / cap) * 100) + "%";
+  bar.classList.toggle("full", full);
+  $("startBtn").disabled = signedIn() && full;
+  $("startBtn").textContent = !signedIn() ? "Start recording"
+    : full ? "Free limit reached" : "Start recording";
+}
+
+async function submitAuth(mode) {
+  const email = $("email").value.trim();
+  const password = $("password").value;
+  try {
+    const res = await fetch(mode === "signup" ? "/api/accounts" : "/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 200 || res.status === 201) {
+      storageSet(TOKEN_KEY, data.token);
+      storageSet(EMAIL_KEY, data.email);
+      authCardPinned = false;
+      $("password").value = "";
+      setStatus("setupStatus", "Signed in as " + data.email + ". You can record.", "ok");
+      await refreshAccount();
+    } else {
+      setStatus("authStatus", data.error || "That did not work (" + res.status + ").", "error");
+    }
+  } catch {
+    setStatus("authStatus", "Network error — try again.", "error");
+  }
+}
+
+function signOut(message) {
+  const t = token();
+  if (t) fetch("/api/sessions/current", { method: "DELETE", headers: { Authorization: "Bearer " + t } }).catch(() => {});
+  storageRemove(TOKEN_KEY);
+  storageRemove(EMAIL_KEY);
+  if (message) setStatus("setupStatus", message, "error");
+  refreshAccount();
+}
+
+// --- recording ------------------------------------------------------------
+
+async function startRecording() {
+  if (!signedIn()) {
+    authCardPinned = true;
+    $("auth").classList.remove("hidden");
+    $("auth").scrollIntoView({ behavior: "smooth", block: "start" });
+    setStatus("authStatus", "Create a free account (or sign in) to record — it keeps your clip list private to you.", "");
+    return;
+  }
+  if (await overClipLimit()) {
+    setStatus("setupStatus",
+      `You have used all ${limits.maxClips} free clips. Delete one from “Your clips” below to record another.`, "error");
+    return;
+  }
+  const title = $("title").value.trim();
+  const mime = pickMime();
+  if (!mime) {
+    setStatus("setupStatus", "This browser cannot record video (MediaRecorder missing). Desktop Chrome is supported.", "error");
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    setStatus("setupStatus", "This browser has no screen capture. Please use desktop Chrome.", "error");
+    return;
+  }
+
+  let display;
+  try {
+    display = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30, max: 30 } },
+      audio: true
+    });
+  } catch (err) {
+    if (err && (err.name === "NotAllowedError" || err.name === "AbortError")) {
+      setStatus("setupStatus", "Recording cancelled — nothing was captured.", "error");
+    } else {
+      setStatus("setupStatus", "Could not start screen capture: " + (err && err.message ? err.message : err), "error");
+    }
+    return;
+  }
+
+  // The microphone is separate from the share picker's audio.
+  let mic = null;
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true }
+    });
+  } catch {
+    setStatus("setupStatus", "Microphone unavailable — recording with the captured audio only.", "");
+  }
+
+  const tracks = [...display.getVideoTracks()];
+  const audioTracks = [...(mic ? mic.getAudioTracks() : []), ...display.getAudioTracks()];
+  recordingStream = new MediaStream([...tracks, ...audioTracks]);
+
+  try {
+    recorder = new MediaRecorder(recordingStream, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
+  } catch (err) {
+    stopAllTracks();
+    setStatus("setupStatus", "Could not start the recorder: " + (err && err.message ? err.message : err), "error");
+    return;
+  }
+
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  recorder.onerror = (e) => finishRecording(true, e.error);
+  recorder.onstop = () => finishRecording(false, null);
+
+  // Chrome's "Stop sharing" button ends the video track: treat it as stop.
+  const videoTrack = display.getVideoTracks()[0];
+  if (videoTrack) videoTrack.addEventListener("ended", () => stopRecording(false), { once: true });
+
+  recordStart = performance.now();
+  autoStopped = false;
+  recorder.start(1000);
+  pendingTitle = title;
+
+  show("recording");
+  timerHandle = setInterval(() => {
+    const ms = performance.now() - recordStart;
+    $("timer").textContent = fmtClock(ms);
+    const bytes = chunks.reduce((n, c) => n + c.size, 0);
+    $("sizeNote").textContent = bytes > 1024 ? " · " + fmtBytes(bytes) : "";
+    // stop just before the free cap so the recording still saves
+    if (!autoStopped && ms >= limits.maxDurationMs) {
+      autoStopped = true;
+      stopRecording(false);
+      setStatus("setupStatus", `Stopped at the free ${Math.round(limits.maxDurationMs / 60000)}-minute limit — saving what you have.`, "");
+    }
+  }, 250);
+
+  $("preview").srcObject = display;
+  $("preview").classList.remove("hidden");
+  $("preview").muted = true;
+}
+
+// The server enforces the cap too; this saves a wasted recording.
+async function overClipLimit() {
+  try {
+    const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data.limits) limits = data.limits;
+    renderUsage(data.usage, data.limits);
+    return data.usage && data.usage.clips >= limits.maxClips;
+  } catch {
+    return false;
+  }
+}
+
+function stopAllTracks() {
+  if (recordingStream) for (const t of recordingStream.getTracks()) t.stop();
+  if (recordingStream) recordingStream = null;
+}
+
+function stopRecording(manual) {
+  if (!recorder || recorder.state === "inactive") return;
+  pendingDurationMs = performance.now() - recordStart;
+  clearInterval(timerHandle);
+  try { recorder.stop(); } catch { finishRecording(false, null); }
+}
+
+// Assembles the blob and moves on to saving.
+function finishRecording(hadError, error) {
+  clearInterval(timerHandle);
+  $("preview").srcObject = null;
+  $("preview").classList.add("hidden");
+  const mime = recorder ? recorder.mimeType : pickMime();
+  stopAllTracks();
+  recorder = null;
+
+  if (hadError) {
+    chunks = [];
+    show("setup");
+    setStatus("setupStatus", "Recording failed: " + (error && error.message ? error.message : "unknown recorder error") + ". Nothing was saved.", "error");
+    return;
+  }
+  if (!chunks.length) {
+    show("setup");
+    setStatus("setupStatus", "Nothing was recorded.", "error");
+    return;
+  }
+
+  pendingBlob = new Blob(chunks, { type: mime || "video/webm" });
+  chunks = [];
+  saveRecording();
+}
+
+// --- saving ----------------------------------------------------------------
+
+async function saveRecording() {
+  let blob = pendingBlob;
+  const durationMs = Math.max(0, Math.round(pendingDurationMs));
+
+  // MediaRecorder webm files carry no duration; patch it in so players and
+  // seeking behave. On any failure the original blob is uploaded as-is.
+  if (blob.type.includes("webm") && durationMs > 0 && typeof window.ysFixWebmDuration === "function") {
+    try {
+      blob = await Promise.race([
+        window.ysFixWebmDuration(blob, durationMs),
+        new Promise((resolve) => setTimeout(() => resolve(blob), 5000))
+      ]);
+    } catch { /* keep the unpatched blob */ }
+  }
+  pendingBlob = blob;
+
+  show("saving");
+  setProgress(0);
+
+  const xhr = new XMLHttpRequest();
+  uploadXhr = xhr;
+  xhr.open("POST", "/api/clips");
+  xhr.setRequestHeader("Content-Type", blob.type || "video/webm");
+  xhr.setRequestHeader("X-Title", encodeURIComponent(pendingTitle));
+  xhr.setRequestHeader("X-Duration-Ms", String(durationMs));
+  xhr.setRequestHeader("Authorization", "Bearer " + token());
+  xhr.responseType = "json";
+
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) setProgress(e.loaded / e.total); };
+  xhr.onload = () => {
+    uploadXhr = null;
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
+      const data = xhr.response;
+      rememberLocally(data);
+      renderServerClips();
+
+      const url = new URL(location.href);
+      url.hash = "";
+      $("shareLink").value = url.origin + data.sharePath;
+      $("manageLink").value = url.origin + data.managePath;
+      $("openShare").href = data.sharePath;
+      $("resultNote").textContent = "Saved — " + fmtBytes(data.bytes) + " is now shareable.";
+      show("result");
+    } else {
+      const detail = xhr.response && xhr.response.error ? " (" + xhr.response.error + ")" : "";
+      if (xhr.status === 401) {
+        showSaveFailure("Your session expired — sign in again to save. " + detail);
+        signOut();
+      } else if (xhr.status === 403 || xhr.status === 413) {
+        showSaveFailure("Nothing was saved. " + (xhr.response && xhr.response.error ? xhr.response.error : "The save was refused.") + " Your recording is still here — download a copy or delete a clip and retry.");
+      } else {
+        showSaveFailure("The save failed" + detail + ". The recording is still here — you can retry.");
+      }
+    }
+  };
+  xhr.onerror = () => {
+    uploadXhr = null;
+    showSaveFailure("The save failed (network error). The recording is still here — you can retry.");
+  };
+  xhr.onabort = () => { uploadXhr = null; };
+
+  xhr.send(blob);
+}
+
+// The manage key is kept on this device as well: it deletes the clip even
+// signed out, and the account list covers everything else.
+function rememberLocally(data) {
+  const list = loadRecordings();
+  list.unshift({
+    id: data.id, token: data.manageToken, title: pendingTitle || null,
+    bytes: data.bytes, createdAt: data.createdAt
+  });
+  saveRecordings(list);
+}
+
+function setProgress(fraction) {
+  const pct = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+  $("bar").style.width = pct + "%";
+  $("pct").textContent = pct + "%";
+}
+
+function showSaveFailure(message) {
+  show("failed");
+  setStatus("failNote", message, "error");
+}
+
+// --- lists -----------------------------------------------------------------
+
+async function renderServerClips() {
+  let clips = [];
+  try {
+    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token() } });
+    if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+    clips = (await res.json()).clips || [];
+  } catch { return; }
+  const tokens = new Map(loadRecordings().map((r) => [r.id, r.token]));
+  const ul = $("recList");
+  ul.textContent = "";
+  $("recEmpty").classList.toggle("hidden", clips.length > 0);
+  for (const clip of clips) {
+    ul.appendChild(clipRow({
+      id: clip.id, token: tokens.get(clip.id), title: clip.title,
+      bytes: clip.bytes, createdAt: clip.createdAt
+    }, () => renderServerClips()));
+  }
+  renderUsage({ clips: clips.length, bytes: clips.reduce((n, c) => n + (c.bytes || 0), 0) }, limits);
+}
+
+function renderDeviceRecordings() {
+  const list = loadRecordings();
+  $("deviceEmpty").classList.toggle("hidden", list.length > 0);
+  const ul = $("deviceList");
+  ul.textContent = "";
+  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings));
+}
+
+function clipRow(rec, refresh) {
+  const li = document.createElement("li");
+
+  const title = document.createElement("span");
+  title.className = "rtitle";
+  title.textContent = rec.title || "Untitled recording";
+  li.appendChild(title);
+
+  const meta = document.createElement("span");
+  meta.className = "rmeta";
+  meta.textContent = new Date(rec.createdAt).toLocaleString() + " · " + fmtBytes(rec.bytes);
+  li.appendChild(meta);
+
+  const watch = document.createElement("a");
+  watch.href = "/v/" + rec.id;
+  watch.textContent = "share";
+  li.appendChild(watch);
+
+  const manage = document.createElement("a");
+  manage.href = "/v/" + rec.id + (rec.token ? "?k=" + encodeURIComponent(rec.token) : "");
+  manage.textContent = "manage";
+  li.appendChild(manage);
+
+  const del = document.createElement("button");
+  del.className = "danger del";
+  del.textContent = "Delete";
+  del.onclick = () => deleteFromList(rec, refresh);
+  li.appendChild(del);
+
+  return li;
+}
+
+async function deleteFromList(rec, refresh) {
+  if (!confirm("Delete “" + (rec.title || "Untitled recording") + "” for everyone with the link?")) return;
+  const headers = {};
+  if (signedIn()) headers.Authorization = "Bearer " + token();
+  else if (rec.token) headers.Authorization = "Bearer " + rec.token;
+  try {
+    const res = await fetch("/api/clips/" + encodeURIComponent(rec.id), { method: "DELETE", headers });
+    if (res.status === 204 || res.status === 404) {
+      saveRecordings(loadRecordings().filter((r) => r.id !== rec.id));
+      refresh();
+    } else if (res.status === 401) {
+      alert("Sign in to manage this clip (or use its manage link).");
+    } else {
+      alert("Deletion failed (" + res.status + "). Try the manage link.");
+    }
+  } catch {
+    alert("Deletion failed (network error). Try the manage link.");
+  }
+}
+
+// --- export, delete everything ---------------------------------------------
+
+async function exportEverything() {
+  if (!signedIn()) return;
+  try {
+    const res = await fetch("/api/my/export", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      window.location = data.exportPath;
+    } else {
+      alert("Export failed (" + res.status + "). Try again.");
+    }
+  } catch {
+    alert("Export failed (network error). Try again.");
+  }
+}
+
+async function deleteEverything() {
+  if (!signedIn()) return;
+  if (!confirm("Delete every clip? Share links stop working for everyone — this cannot be undone.")) return;
+  try {
+    const res = await fetch("/api/my/clips", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      setStatus("setupStatus", "All your clips were deleted.", "ok");
+      await renderServerClips();
+    } else {
+      alert("Deletion failed (" + res.status + ").");
+    }
+  } catch {
+    alert("Deletion failed (network error).");
+  }
+}
+
+async function deleteAccount() {
+  if (!signedIn()) return;
+  if (!confirm("Delete your account and every clip? This cannot be undone.")) return;
+  try {
+    const res = await fetch("/api/my/account", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      storageRemove(TOKEN_KEY);
+      storageRemove(EMAIL_KEY);
+      setStatus("setupStatus", "Your account and all its clips were deleted.", "ok");
+      await refreshAccount();
+    } else {
+      alert("Account deletion failed (" + res.status + ").");
+    }
+  } catch {
+    alert("Account deletion failed (network error).");
+  }
+}
+
+// --- wiring ----------------------------------------------------------------
+
+let authMode = "signup";
+
+$("startBtn").onclick = startRecording;
+$("stopBtn").onclick = () => stopRecording(true);
+$("againBtn").onclick = () => {
+  pendingBlob = null;
+  $("title").value = "";
+  show("setup");
+  setStatus("setupStatus", "Ready.", "");
+};
+$("retryBtn").onclick = () => saveRecording();
+$("discardBtn").onclick = () => {
+  pendingBlob = null;
+  show("setup");
+  setStatus("setupStatus", "Discarded — nothing was saved.", "");
+};
+$("localBtn").onclick = () => {
+  if (!pendingBlob) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(pendingBlob);
+  a.download = "recording." + (pendingBlob.type.includes("mp4") ? "mp4" : "webm");
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+};
+
+$("signInLink").onclick = () => {
+  authCardPinned = true;
+  setAuthMode("signin");
+  $("auth").classList.remove("hidden");
+  $("email").focus();
+};
+$("signOutLink").onclick = () => signOut();
+
+function setAuthMode(mode) {
+  authMode = mode;
+  $("authTitle").textContent = mode === "signup" ? "Sign up — it's free" : "Sign in";
+  $("authBtn").textContent = mode === "signup" ? "Create account" : "Sign in";
+  $("authSwitch").innerHTML = mode === "signup"
+    ? "Already recording here? <a id=\"authToggle\">Sign in</a>"
+    : "New here? <a id=\"authToggle\">Create a free account</a>";
+  document.getElementById("authToggle").onclick = () => setAuthMode(authMode === "signup" ? "signin" : "signup");
+  $("password").autocomplete = mode === "signup" ? "new-password" : "current-password";
+}
+
+$("authBtn").onclick = () => submitAuth(authMode);
+$("password").addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth(authMode); });
+$("email").addEventListener("keydown", (e) => { if (e.key === "Enter") $("password").focus(); });
+
+$("exportBtn").onclick = exportEverything;
+$("deleteAllBtn").onclick = deleteEverything;
+$("deleteAccountLink").onclick = (e) => { e.preventDefault(); deleteAccount(); };
+
+for (const btn of document.querySelectorAll("[data-copy]")) {
+  btn.onclick = () => {
+    const input = $(btn.dataset.copy);
+    navigator.clipboard.writeText(input.value).then(() => {
+      const old = btn.textContent;
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    });
+  };
+}
+
+window.addEventListener("beforeunload", (e) => {
+  if (recorder && recorder.state === "recording") {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
+(async () => {
+  try {
+    const res = await fetch("/api/limits");
+    if (res.ok) {
+      const data = await res.json();
+      limits = { maxClips: data.maxClips, maxDurationMs: data.maxDurationMs, maxClipBytes: data.maxClipBytes };
+    }
+  } catch { /* fall back to the defaults above */ }
+  setAuthMode("signup");
+  await refreshAccount();
+})();
+</script>
+</body>
+</html>
