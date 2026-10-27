@@ -174,6 +174,51 @@ async function main() {
   check("a second account's list is private and empty", strangerEmail === "stranger@example.com" && strangerList === 0,
     `${strangerEmail}, ${strangerList} rows`);
 
+  // 4b. signing out must hide the departing creator's clips; signing in as
+  // somebody else on the same browser profile must expose none of them —
+  // no rows, no manage links, and a stale in-flight list request must not
+  // bring them back
+  const switcher = await authorContext.newPage();
+  switcher.on("dialog", (d) => d.accept());
+  await switcher.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await switcher.waitForFunction(() => document.querySelectorAll("#recList li").length === 3, { timeout: 15000 });
+  await switcher.click("#signOutLink");
+  await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const signedOutState = await switcher.waitForFunction(() =>
+    document.getElementById("clipsCard").classList.contains("hidden")
+      && document.querySelectorAll("#recList li").length === 0
+      && !document.body.innerHTML.includes("?k=")
+  , { timeout: 10000 }).then(() => true, () => switcher.evaluate(() => ({
+    rows: document.querySelectorAll("#recList li").length,
+    clipsHidden: document.getElementById("clipsCard").classList.contains("hidden"),
+    leaksKeys: document.body.innerHTML.includes("?k=")
+  })));
+  check("signing out empties the clip list and its manage keys",
+    signedOutState === true, JSON.stringify(signedOutState));
+  await fill(switcher, "#email", "successor@example.com");
+  await fill(switcher, "#password", "correct horse battery");
+  await switcher.click("#authBtn");
+  await switcher.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden")
+      && /of 3/.test(document.getElementById("usageText").textContent), { timeout: 15000 });
+  const successorState = await switcher.evaluate(() => ({
+    email: document.getElementById("whoami").textContent,
+    rows: document.querySelectorAll("#recList li").length,
+    leaksKeys: document.body.innerHTML.includes("?k=")
+  }));
+  check("another creator on the same browser sees none of the first creator's clips",
+    successorState.email === "successor@example.com" && successorState.rows === 0 && !successorState.leaksKeys,
+    JSON.stringify(successorState));
+  // hand the shared profile back to the original author for the later steps
+  await switcher.click("#signOutLink");
+  await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await switcher.click("#signInLink");
+  await fill(switcher, "#email", "author@example.com");
+  await fill(switcher, "#password", "correct horse battery");
+  await switcher.click("#authBtn");
+  await switcher.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await switcher.close();
+
   // 5. a viewer without any account opens a share link
   const viewerContext = await browser.createBrowserContext();
   const viewer = await viewerContext.newPage();

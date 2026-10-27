@@ -10,7 +10,7 @@ const crypto = require("node:crypto");
 const { Store, UploadTooLarge } = require("./lib/store");
 const { Accounts } = require("./lib/accounts");
 const { createTar } = require("./lib/tar");
-const { readWebmDurationMs } = require("./lib/webm-duration");
+const { scanWebmDurationFile } = require("./lib/webm-duration");
 
 const port = Number(process.env.PORT ?? 3000); // 0 is allowed: tests pick an ephemeral port
 const dataDir = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -170,7 +170,10 @@ async function createClip(req, res) {
     const title = decodeTitle(req.headers["x-title"]);
     const durationMs = Number(req.headers["x-duration-ms"]);
     const declaredDuration = Number.isFinite(durationMs) ? durationMs : null;
-    if (declaredDuration !== null && declaredDuration > limits.maxDurationMs) {
+    // a fast pre-upload rejection of grossly over-cap declarations; the
+    // recorder's own auto-stop runs a beat past the cap (timer granularity),
+    // so the same slop as the real check below applies here
+    if (declaredDuration !== null && declaredDuration > limits.maxDurationMs + 2000) {
         sendError(res, 413, `the free plan stores clips up to ${Math.round(limits.maxDurationMs / 60000)} minutes — this one is longer`);
         return;
     }
@@ -185,32 +188,31 @@ async function createClip(req, res) {
         accountId: account.id
     });
 
-    // Verify the duration from the file itself when it is a webm: a header
-    // the client controls is not an enforcement point.
+    // The duration is verified from the file's own media timeline — the
+    // cluster/block timestamps, not the Info.Duration float, which is
+    // client-writable text and no enforcement point. A webm whose timeline
+    // cannot be read at all is refused: the cap is only as strong as the
+    // verification behind it, so verification failing closes the door.
     if (contentType.includes("webm") || contentType.includes("matroska")) {
+        let verified = null;
         try {
-            const head = Buffer.alloc(Math.min(1024 * 1024, meta.bytes));
-            const file = await fs.promises.open(store.videoPath(meta.id), "r");
-            try {
-                const { bytesRead } = await file.read(head, 0, head.length, 0);
-                const parsed = readWebmDurationMs(head.subarray(0, bytesRead));
-                if (parsed !== null) {
-                    if (parsed > limits.maxDurationMs + 2000) { // small encoder slop
-                        await store.remove(meta.id, { token: manageToken });
-                        sendError(res, 413, `the free plan stores clips up to ${Math.round(limits.maxDurationMs / 60000)} minutes — this one runs ${Math.round(parsed / 60000)}`);
-                        return;
-                    }
-                    if (meta.durationMs === null) {
-                        meta.durationMs = parsed;
-                        await store.updateMeta(meta);
-                    }
-                }
-            } finally {
-                await file.close();
-            }
+            verified = await scanWebmDurationFile(store.videoPath(meta.id));
         } catch {
-            // unreadable duration falls back to the declared one
+            verified = null; // unreadable file: the same fail-closed path
         }
+        if (verified === null) {
+            await store.remove(meta.id, { token: manageToken });
+            sendError(res, 413, "the recording's length could not be verified from the file itself, so the free plan cannot store it");
+            return;
+        }
+        if (verified > limits.maxDurationMs + 2000) { // small encoder slop
+            await store.remove(meta.id, { token: manageToken });
+            sendError(res, 413, `the free plan stores clips up to ${Math.round(limits.maxDurationMs / 60000)} minutes — this one runs ${Math.round(verified / 60000)}`);
+            return;
+        }
+        // the timeline is the truth, even when the declared header disagrees
+        meta.durationMs = verified;
+        await store.updateMeta(meta);
     }
 
     // Recount after the write: two concurrent uploads must not sneak past the cap.

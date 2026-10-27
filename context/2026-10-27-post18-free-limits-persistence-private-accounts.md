@@ -112,3 +112,71 @@ re-queued:
 - Push queued via request_push. Remaining: CI verdict + preview link (next
   session's first job), and the open platform question on the real volume
   mount path for DATA_DIR.
+
+## Review round 1 (2026-10-27, later session): the four required changes
+
+The platform review of 5fe5a2f asked for four changes. All four are made on
+this branch; decisions taken:
+
+- **accounts.js — serialized, copy-on-write persistence.** Every account
+  mutation (create/login/logout/remove) and its persistence commit now runs
+  through one queue (`runExclusive`), so two signups can no longer interleave
+  writes into `accounts.json.tmp`. Each commit writes a uniquely owned temp
+  file (`accounts.json.<pid>.<seq>.<rand>.tmp`), fsyncs, then atomically
+  renames — a rename can no longer fail with ENOENT because another writer
+  renamed the shared temp away. Mutations are copy-on-write: the new state is
+  committed first and only then becomes live, and a failed commit rolls memory
+  back, so no uncommitted account/session stays active. `save()` remains as a
+  queued commit for outside callers; `pruneSessions`/`dropSessionsOf` were
+  folded into create/login/remove (nothing external called them). New tests:
+  8 concurrent signups + a duplicated-email race, verified after "restarting"
+  (fresh `Accounts` over the same directory); 5 logins racing 5 logouts; a
+  pre-restart session token still authenticating post-restart; no stray .tmp.
+- **store.js — scoped cleanup, real teardown.** Failed/empty uploads now
+  remove only their own staging file (the old `rm(path.dirname(staging),
+  {recursive:true})` deleted the *shared* tmp directory and every in-flight
+  upload with it). On failure the pipeline is torn down in flow order —
+  unpipe, destroy counting and output streams, wait for the output file's
+  `close` — and only then is the file removed; the request is drained (not
+  destroyed) so the error response still reaches the client. New test: an
+  oversized upload pushed past the cap mid-flight while a valid upload
+  streams concurrently — the valid one survives with its file intact and the
+  tmp dir ends empty.
+- **webm-duration.js — duration from the media timeline, fail closed.** The
+  old parser read only `Info.Duration` — a client-writable float, useless as
+  enforcement (a 5-minute video claiming 1 s passed). It is now a streaming
+  EBML scanner that measures the actual timeline: Cluster Timestamps plus
+  SimpleBlock/Block timecodes, finished with the last frame's length (its
+  BlockDuration, else the gap to the previous block, capped at 2 s).
+  `Info.Duration` is deliberately never read. The server streams the whole
+  stored file through the scanner (no 1 MB head cut, so nothing at the tail
+  is missed) and: refuses any webm/matroska whose timeline cannot be verified
+  at all (fail closed — no more client-declared fallback), refuses over-cap
+  timelines, and records the *verified* duration even when the header
+  disagrees. Known boundary: non-webm uploads (mp4) still carry only the
+  declared header — noted in the thread. Tests: understated `Info.Duration`
+  (1 s claimed, 40 s timeline → refused), missing Duration, unverifiable
+  bytes → 413, streaming scanner fed at 1/3/7/4096-byte chunks equals the
+  buffered read. Two scanner bugs found and fixed while testing: skip
+  accounting after reading a block's timecode, and small elements (Cluster
+  Timestamp, TimestampScale, BlockDuration) whose bodies span a chunk
+  boundary being discarded as "unknown" instead of awaited.
+- **recorder.html — the manage-key cache is account-scoped.** Previously
+  *every* authenticated upload went into the global `openloom.recordings`
+  list, which `deviceCard` renders signed out — handing the departing
+  creator's clip list and deletion keys to whoever opens the browser next.
+  Now: recordings made while signed in are cached under
+  `openloom.recordings:<email>` and render only while that account is
+  authenticated; the global key holds only genuine no-account recordings from
+  the pre-accounts build, and the card's copy now says exactly that. Sign-out
+  and account switches clear the rendered list at once, and a list response
+  that was in flight during the switch is discarded (token captured before
+  the fetch, compared after) so it cannot repopulate the page. Deleting the
+  account removes its cache. The browser scenario in `e2e/record.mjs` signs
+  out and signs in as another creator on the same profile and asserts no rows
+  and no `?k=` manage links anywhere on the page.
+- Related fix found while re-reading the path: the declared-duration
+  prefilter refused at exactly the cap, but the recorder's auto-stop fires up
+  to a timer tick *after* the cap — a legitimate 5-minute recording could be
+  refused on its declared header. The prefilter now uses the same +2 s slop
+  as the real (timeline) check.

@@ -184,7 +184,7 @@
 
   <section class="card hidden" id="deviceCard">
     <h1 style="font-size:1.1rem">Recorded on this device</h1>
-    <p class="sub">Made before you signed in on this browser — saved in this browser only.</p>
+    <p class="sub">Made in this browser without an account, before OpenLoom accounts existed — kept on this device only.</p>
     <ul class="recordings" id="deviceList"></ul>
     <p class="empty" id="deviceEmpty">Nothing here.</p>
   </section>
@@ -196,6 +196,10 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+// The old global key holds only recordings made without an account (from the
+// first build, before accounts existed). Everything recorded since is cached
+// under a key scoped to the account that made it, so signing out — or signing
+// in as somebody else — never exposes another creator's clips or keys.
 const STORE_KEY = "openloom.recordings";
 const TOKEN_KEY = "openloom.token";
 const EMAIL_KEY = "openloom.email";
@@ -237,11 +241,33 @@ function storageRemove(key) {
 function token() { return storage(TOKEN_KEY, null); }
 function signedIn() { return !!token(); }
 
-function loadRecordings() {
+function accountRecordingsKey(email) {
+  return STORE_KEY + ":" + email;
+}
+
+// Recordings made without an account, cached under the original global key.
+function loadLegacyRecordings() {
   try { return JSON.parse(storage(STORE_KEY, "[]")) || []; } catch { return []; }
 }
-function saveRecordings(list) {
+function saveLegacyRecordings(list) {
   storageSet(STORE_KEY, JSON.stringify(list.slice(0, 50)));
+}
+
+// The offline manage-key cache of the account that is signed in. Keyed by the
+// account, rendered only while that account is authenticated on this browser.
+function loadAccountRecordings() {
+  const email = storage(EMAIL_KEY, null);
+  if (!email) return [];
+  try { return JSON.parse(storage(accountRecordingsKey(email), "[]")) || []; } catch { return []; }
+}
+function saveAccountRecordings(list) {
+  const email = storage(EMAIL_KEY, null);
+  if (!email) return;
+  storageSet(accountRecordingsKey(email), JSON.stringify(list.slice(0, 50)));
+}
+function removeAccountRecordings() {
+  const email = storage(EMAIL_KEY, null);
+  if (email) storageRemove(accountRecordingsKey(email));
 }
 
 function fmtBytes(n) {
@@ -280,7 +306,8 @@ async function refreshAccount() {
   $("signOutLink").classList.toggle("hidden", !signed);
   $("auth").classList.toggle("hidden", signed || authCardPinned);
   $("clipsCard").classList.toggle("hidden", !signed);
-  $("deviceCard").classList.toggle("hidden", signed || loadRecordings().length === 0);
+  // genuine no-account recordings from this device, visible signed in or not
+  $("deviceCard").classList.toggle("hidden", loadLegacyRecordings().length === 0);
   $("whoami").classList.toggle("hidden", !signed);
   if (signed) {
     $("whoami").textContent = storage(EMAIL_KEY, "");
@@ -334,6 +361,7 @@ async function submitAuth(mode) {
       storageSet(EMAIL_KEY, data.email);
       authCardPinned = false;
       $("password").value = "";
+      clearServerList(); // an account switch never shows the previous account's rows
       setStatus("setupStatus", "Signed in as " + data.email + ". You can record.", "ok");
       await refreshAccount();
     } else {
@@ -349,8 +377,15 @@ function signOut(message) {
   if (t) fetch("/api/sessions/current", { method: "DELETE", headers: { Authorization: "Bearer " + t } }).catch(() => {});
   storageRemove(TOKEN_KEY);
   storageRemove(EMAIL_KEY);
+  clearServerList(); // the departing account's clips leave the page at once
   if (message) setStatus("setupStatus", message, "error");
   refreshAccount();
+}
+
+// Empties the rendered account list without touching any cache on disk.
+function clearServerList() {
+  $("recList").textContent = "";
+  $("recEmpty").classList.remove("hidden");
 }
 
 // --- recording ------------------------------------------------------------
@@ -567,15 +602,17 @@ async function saveRecording() {
   xhr.send(blob);
 }
 
-// The manage key is kept on this device as well: it deletes the clip even
-// signed out, and the account list covers everything else.
+// The manage key is cached on this device, under the account that recorded
+// the clip: it renders only while that account is signed in here. Clips made
+// signed in never join the signed-out device list.
 function rememberLocally(data) {
-  const list = loadRecordings();
+  if (!storage(EMAIL_KEY, null)) return;
+  const list = loadAccountRecordings();
   list.unshift({
     id: data.id, token: data.manageToken, title: pendingTitle || null,
     bytes: data.bytes, createdAt: data.createdAt
   });
-  saveRecordings(list);
+  saveAccountRecordings(list);
 }
 
 function setProgress(fraction) {
@@ -592,13 +629,19 @@ function showSaveFailure(message) {
 // --- lists -----------------------------------------------------------------
 
 async function renderServerClips() {
+  const requestToken = token();
+  if (!requestToken) return;
   let clips = [];
   try {
-    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token() } });
+    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + requestToken } });
     if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+    if (!res.ok) return;
     clips = (await res.json()).clips || [];
   } catch { return; }
-  const tokens = new Map(loadRecordings().map((r) => [r.id, r.token]));
+  // a sign-out or account switch while the request was in flight must not
+  // repopulate the page with the departing account's clips
+  if (token() !== requestToken) return;
+  const tokens = new Map(loadAccountRecordings().map((r) => [r.id, r.token]));
   const ul = $("recList");
   ul.textContent = "";
   $("recEmpty").classList.toggle("hidden", clips.length > 0);
@@ -606,20 +649,20 @@ async function renderServerClips() {
     ul.appendChild(clipRow({
       id: clip.id, token: tokens.get(clip.id), title: clip.title,
       bytes: clip.bytes, createdAt: clip.createdAt
-    }, () => renderServerClips()));
+    }, () => renderServerClips(), "account"));
   }
   renderUsage({ clips: clips.length, bytes: clips.reduce((n, c) => n + (c.bytes || 0), 0) }, limits);
 }
 
 function renderDeviceRecordings() {
-  const list = loadRecordings();
+  const list = loadLegacyRecordings();
   $("deviceEmpty").classList.toggle("hidden", list.length > 0);
   const ul = $("deviceList");
   ul.textContent = "";
-  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings));
+  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings, "device"));
 }
 
-function clipRow(rec, refresh) {
+function clipRow(rec, refresh, kind) {
   const li = document.createElement("li");
 
   const title = document.createElement("span");
@@ -637,29 +680,35 @@ function clipRow(rec, refresh) {
   watch.textContent = "share";
   li.appendChild(watch);
 
-  const manage = document.createElement("a");
-  manage.href = "/v/" + rec.id + (rec.token ? "?k=" + encodeURIComponent(rec.token) : "");
-  manage.textContent = "manage";
-  li.appendChild(manage);
+  if (rec.token) {
+    const manage = document.createElement("a");
+    manage.href = "/v/" + rec.id + "?k=" + encodeURIComponent(rec.token);
+    manage.textContent = "manage";
+    li.appendChild(manage);
+  }
 
   const del = document.createElement("button");
   del.className = "danger del";
   del.textContent = "Delete";
-  del.onclick = () => deleteFromList(rec, refresh);
+  del.onclick = () => deleteFromList(rec, refresh, kind);
   li.appendChild(del);
 
   return li;
 }
 
-async function deleteFromList(rec, refresh) {
+async function deleteFromList(rec, refresh, kind) {
   if (!confirm("Delete “" + (rec.title || "Untitled recording") + "” for everyone with the link?")) return;
   const headers = {};
-  if (signedIn()) headers.Authorization = "Bearer " + token();
+  // a device recording carries its own key, which works signed out; an
+  // account clip is managed by the session
+  if (kind === "device" && rec.token) headers.Authorization = "Bearer " + rec.token;
+  else if (signedIn()) headers.Authorization = "Bearer " + token();
   else if (rec.token) headers.Authorization = "Bearer " + rec.token;
   try {
     const res = await fetch("/api/clips/" + encodeURIComponent(rec.id), { method: "DELETE", headers });
     if (res.status === 204 || res.status === 404) {
-      saveRecordings(loadRecordings().filter((r) => r.id !== rec.id));
+      if (kind === "device") saveLegacyRecordings(loadLegacyRecordings().filter((r) => r.id !== rec.id));
+      else saveAccountRecordings(loadAccountRecordings().filter((r) => r.id !== rec.id));
       refresh();
     } else if (res.status === 401) {
       alert("Sign in to manage this clip (or use its manage link).");
@@ -719,8 +768,10 @@ async function deleteAccount() {
       headers: { Authorization: "Bearer " + token() }
     });
     if (res.ok) {
+      removeAccountRecordings(); // the clips and their keys are gone for good
       storageRemove(TOKEN_KEY);
       storageRemove(EMAIL_KEY);
+      clearServerList();
       setStatus("setupStatus", "Your account and all its clips were deleted.", "ok");
       await refreshAccount();
     } else {
