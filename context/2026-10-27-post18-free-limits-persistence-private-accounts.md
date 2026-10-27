@@ -79,8 +79,13 @@ dependencies — Node stdlib only.
   validation), tokens not stored in plaintext, foreign sessions rejected,
   limits (size/duration/count, real webm parsing, a lying header is cut
   off), export (tar + one-time link), delete-all/account, malformed ids,
-  pages/limits.
-- `node e2e/record.mjs` — the full scenario in real Chrome (see above).
+  pages/limits. All pass.
+- `node e2e/record.mjs` — the full scenario in real Chrome (see above):
+  14 checks, all pass. Two environment notes from running it headless in a
+  bare container: headless-shell delivers clicks but not real keyboard
+  events (text goes in as value + input event), and with no font installed
+  the renderer dies on the first new text render after a recording stops —
+  the container needs at least one font behind fontconfig.
 
 ## Known limits
 

@@ -537,7 +537,7 @@ async function saveRecording() {
     if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
       const data = xhr.response;
       rememberLocally(data);
-      renderRecordings();
+      renderServerClips();
 
       const url = new URL(location.href);
       url.hash = "";

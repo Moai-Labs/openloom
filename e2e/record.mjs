@@ -7,6 +7,9 @@
 //   npm i puppeteer   # once, outside CI (downloads a Chrome)
 //   node e2e/record.mjs [baseUrl]
 //
+// In a bare container the browser needs its shared libraries and at least one
+// font (via fontconfig): without a font the renderer dies on the first new
+// text render after a recording stops.
 // Without a baseUrl it starts the server itself on an ephemeral port with a
 // throwaway data directory. Headless Chrome has no screen to pick, so when the
 // real getDisplayMedia picker cannot open the script installs a synthetic
@@ -79,11 +82,22 @@ const FAKE_GET_DISPLAY_MEDIA = `
   };
 `;
 
+// Headless shells deliver clicks but not real keyboard events, so text goes
+// in as a value + input event — the same thing a password manager would do.
+async function fill(page, selector, value) {
+  await page.waitForSelector(selector, { timeout: 10000 });
+  await page.$eval(selector, (el, v) => {
+    el.value = v;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }, value);
+}
+
 async function signUp(page, email) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   await page.waitForSelector("#auth:not(.hidden)", { timeout: 10000 });
-  await page.type("#email", email);
-  await page.type("#password", "correct horse battery");
+  await fill(page, "#email", email);
+  await fill(page, "#password", "correct horse battery");
   await page.click("#authBtn");
   await page.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
@@ -92,7 +106,7 @@ async function signUp(page, email) {
 
 async function main() {
   await startServerIfLocal();
-  const browser = await puppeteer.launch({ headless: true, args: BROWSER_FLAGS });
+  const browser = await puppeteer.launch({ headless: "shell", args: BROWSER_FLAGS });
 
   const failures = [];
   const check = (name, ok, detail = "") => {
@@ -112,7 +126,7 @@ async function main() {
     const page = await authorContext.newPage();
     page.on("pageerror", (err) => console.error("  [pageerror]", err.message));
     await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
-    await page.type("#title", title);
+    await fill(page, "#title", title);
     await page.click("#startBtn");
     try {
       await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
@@ -134,6 +148,7 @@ async function main() {
   check("three clips recorded and saved", shares.every((s) => /^http.*\/v\/[A-Za-z0-9_-]+$/.test(s)), shares.join(", "));
 
   // 3. the usage meter shows the account is full and the button says so
+  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   const fullState = await authorPage.waitForFunction(() => {
     const bar = document.getElementById("usageBar");
     return bar.classList.contains("full");
@@ -181,7 +196,7 @@ async function main() {
     const { exportPath } = await res.json();
     const archive = await fetch(exportPath);
     const buf = await archive.arrayBuffer();
-    const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 512)));
+    const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 4096)));
     return { ok: archive.status === 200, bytes: buf.byteLength, head, type: archive.headers.get("content-type") };
   });
   check("export downloads a tar archive", !!exported && exported.ok && /x-tar/.test(exported.type || ""),
@@ -191,9 +206,11 @@ async function main() {
     exported?.head?.slice(0, 60));
 
   // 7. persistence: back up, wipe, restore — the clip list and files come back
+  let authorToken = null;
   if (dataDir) {
     const metaPath = new URL(shares[1]).pathname.replace("/v/", "/api/clips/");
-    const before = await viewer.evaluate(async (url) => (await fetch(url)).json(), baseUrl + metaPath);
+    const before = await (await fetch(baseUrl + metaPath)).json();
+    authorToken = await authorPage.evaluate(() => localStorage.getItem("openloom.token"));
     const backupDir = dataDir + "-backups";
     execFileSync(process.execPath, ["scripts/backup.mjs", "--dir", backupDir], {
       cwd: REPO, env: { ...process.env, DATA_DIR: dataDir }, stdio: "inherit"
@@ -218,32 +235,35 @@ async function main() {
       child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
     });
     baseUrl = restarted;
-    const after = await viewer.evaluate(async (url) => {
-      const res = await fetch(url);
-      return { status: res.status, body: res.status === 200 ? await res.json() : null };
-    }, restarted + metaPath);
+    // the pages still sit on the pre-restart origin, so these go through node
+    const afterRes = await fetch(restarted + metaPath);
+    const after = { status: afterRes.status, body: afterRes.status === 200 ? await afterRes.json() : null };
     check("a restored server serves the same clip",
       after.status === 200 && after.body.bytes === before.bytes,
       `status ${after.status}`);
-    const stillSignedIn = await authorPage.evaluate(async (url) => {
-      const res = await fetch(url, { headers: { Authorization: "Bearer " + localStorage.getItem("openloom.token") } });
-      return res.status;
-    }, restarted + "/api/me");
+    const stillSignedIn = (await fetch(restarted + "/api/me", {
+      headers: { Authorization: "Bearer " + authorToken }
+    })).status;
     check("accounts survive the restore too", stillSignedIn === 200, `me returned ${stillSignedIn}`);
   } else {
     check("backup/restore demonstration ran against a local server", false, "skipped: a remote baseUrl was given");
   }
 
   // 8. delete everything — on the restarted server, still signed in
+  // (the restart moved ports, so the new origin gets the session back)
   await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await authorPage.evaluate(([t, email]) => {
+    localStorage.setItem("openloom.token", t);
+    localStorage.setItem("openloom.email", email);
+  }, [authorToken, "author@example.com"]);
+  await authorPage.reload({ waitUntil: "networkidle0" });
   await authorPage.waitForFunction(() => /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 });
   authorPage.on("dialog", (d) => d.accept());
   await authorPage.click("#deleteAllBtn");
   const emptied = await authorPage.waitForFunction(() =>
     document.querySelectorAll("#recList li").length === 0, { timeout: 10000 }).then(() => true, () => false);
   check("delete everything empties the list", emptied);
-  const goneAfterPurge = await viewer.evaluate(async (url) => (await fetch(url)).status,
-    baseUrl + new URL(shares[0]).pathname.replace("/v/", "/api/clips/"));
+  const goneAfterPurge = (await fetch(baseUrl + new URL(shares[0]).pathname.replace("/v/", "/api/clips/"))).status;
   check("deleted clips stop playing for viewers", goneAfterPurge === 404, `meta now returns ${goneAfterPurge}`);
 
   await browser.close();
