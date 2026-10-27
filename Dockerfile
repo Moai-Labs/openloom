@@ -1,7 +1,11 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY server.js ./
-ENV NODE_ENV=production PORT=3000
+COPY package.json server.js ./
+COPY lib ./lib
+COPY public ./public
+# The clip store lives here; writable by the unprivileged runtime user.
+RUN mkdir -p /app/data && chown node:node /app/data
+ENV NODE_ENV=production PORT=3000 DATA_DIR=/app/data
 EXPOSE 3000
 USER node
 CMD ["node", "server.js"]
