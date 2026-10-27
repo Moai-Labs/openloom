@@ -80,3 +80,35 @@ verified in the product.
   verify path; noted in case we ever need event scanning). If
   `sepolia.base.org` proves flaky in production, set `BASE_SEPOLIA_RPC_URL`
   to a paid endpoint.
+
+## Review round 1 (2026-10-27): concurrency hardening
+
+The platform review asked for three changes, all made in one commit:
+
+- **Serialized persistence** for accounts.json and invoices.json. Both
+  classes share the same pattern: `runExclusive()` chains every mutation and
+  its commit off a never-rejected tail (one failed write does not poison the
+  queue); `commit()` writes a uniquely named temp file
+  (`<path>.<pid>.<seq>.<random>.tmp`), fsyncs, then atomically renames.
+  Mutations are copy-on-write with rollback on commit failure, so memory
+  always equals disk after each operation. Code holding the lock calls
+  `commit()`, never `save()` (which re-enters the queue and would deadlock).
+- **setPlan contract note**: `payments.extendPaid` mutates `account.plan`
+  and returns a timestamp; `accounts.setPlan(accountId, planOf)` accepts
+  both that and a planOf that returns a plan object.
+- **Upload teardown**: on failure `createFromStream` unpipes in flow order,
+  destroys the transform and writer, then `req.resume()` to drain the body
+  at socket speed — draining rather than destroying the socket so the 413
+  response still reaches the client. Only the upload's own staging file is
+  removed, never the shared tmp directory (the old code deleted the
+  directory, racing any concurrent upload into it).
+- **Bonus race found and fixed**: two concurrent verifies of the same
+  receipt could both pass the `status === "pending"` check during the RPC
+  wait and both extend the plan. `Invoices.markPaid` is now the
+  serialization point: same txHash re-verify → `{already: true}` (the
+  handler answers 200 with `alreadyPaid: true`, no second extension);
+  different txHash on a paid invoice → 409.
+- Suite grew 35 → 41 tests (concurrent account ops, failing-commit
+  rollback, concurrent invoice create/expire, valid upload vs concurrent
+  empty + oversized uploads, double-verify race). Verified stable across
+  repeated runs and a 3-round soak of 60 concurrent operations.
