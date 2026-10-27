@@ -18,11 +18,15 @@ process.env.MAX_UPLOAD_BYTES = String(64 * 1024); // absolute guard, small so te
 process.env.FREE_MAX_CLIPS = "2";
 process.env.FREE_MAX_CLIP_BYTES = String(16 * 1024);
 process.env.FREE_MAX_DURATION_MS = "30000";
+// paid-plan limits, shrunk so tests exercise them without real payloads
+process.env.PAID_MAX_CLIPS = "50";
+process.env.PAID_MAX_TOTAL_BYTES = String(13 * 1024);
 
 const server = require("../server.js");
 const { Store } = require("../lib/store");
 const { readTar } = require("../lib/tar");
 const { readWebmDurationMs } = require("../lib/webm-duration");
+const payments = require("../lib/payments");
 
 // The server listens inside its own async boot; wait for the port.
 async function waitForListen() {
@@ -107,10 +111,11 @@ test("the limits page is published", async () => {
   assert.ok(html.includes("3 stored clips"));
   assert.ok(html.includes("5 minutes"));
   assert.ok(html.includes("100 MB"));
-  assert.ok(html.includes("not available yet"), "no upgrade is sold before it exists");
+  assert.ok(html.includes("test USDC"), "the paid plan says how it is paid");
+  assert.ok(!html.includes("not available yet"), "the paid plan is available now");
 });
 
-test("the limits API states the free plan", async () => {
+test("the limits API states the free plan and the paid plan", async () => {
   const res = await request("GET", "/api/limits");
   assert.equal(res.status, 200);
   const data = JSON.parse(res.body);
@@ -118,6 +123,18 @@ test("the limits API states the free plan", async () => {
   assert.equal(data.maxClips, 2); // as shrunk by env for this suite
   assert.equal(data.maxDurationMs, 30000);
   assert.equal(data.maxClipBytes, 16 * 1024);
+  assert.equal(data.priceUsd, 10);
+  assert.equal(data.paidPlan.totalBytes, 13 * 1024); // as shrunk by env for this suite
+  assert.equal(data.test, true);
+  assert.match(data.notice, /test/i);
+});
+
+test("the upgrade page is published and says payments are tests", async () => {
+  const res = await request("GET", "/upgrade");
+  assert.equal(res.status, 200);
+  const html = res.body.toString();
+  assert.ok(html.includes("test payment"), "the page labels the payment a test");
+  assert.ok(html.includes("2 GB"));
 });
 
 test("watch page is served at /v/<id>", async () => {
@@ -551,5 +568,218 @@ function minimalWebm(durationMs) {
   parts.push(Buffer.from([0xa3, 0x84, 0x01, 0x02, 0x03, 0x04])); // a SimpleBlock-ish blob
   return Buffer.concat(parts);
 }
+
+// --- payments: unit level ---------------------------------------------------
+
+function transferLog({ contract, to, microUsdc }) {
+  return {
+    address: contract,
+    topics: [
+      payments.TRANSFER_TOPIC,
+      "0x" + Buffer.alloc(32).toString("hex"), // from — irrelevant to verification
+      "0x" + payments.pad32(payments.hexToBuffer(to)).toString("hex")
+    ],
+    data: "0x" + payments.amountTo32Bytes(microUsdc).toString("hex")
+  };
+}
+
+// A fetch replacement that answers JSON-RPC without touching a network.
+function stubFetch({ chainId = payments.CHAIN_ID, receipt = null } = {}) {
+  return async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(chainId).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+}
+
+test("receiving addresses are valid, checksum-free hex and never repeat", () => {
+  const seen = new Set();
+  for (let i = 0; i < 20; i++) {
+    const address = payments.newReceivingAddress();
+    assert.match(address, /^0x[0-9a-f]{40}$/);
+    assert.ok(!seen.has(address));
+    seen.add(address);
+  }
+});
+
+test("a receipt with the exact transfer verifies; the near misses do not", () => {
+  const to = payments.newReceivingAddress();
+  const expected = { contract: payments.USDC_CONTRACT, toAddress: to, topic0: payments.TRANSFER_TOPIC, expectedMicroUsdc: 10_000_000n };
+  const right = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 10_000_000n })] };
+  assert.equal(payments.judgeReceipt(right, expected), "verified");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 9_999_999n })] }, expected), "wrong-amount");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: payments.newReceivingAddress(), microUsdc: 10_000_000n })] }, expected), "unrelated");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: "0x" + "ab".repeat(20), to, microUsdc: 10_000_000n })] }, expected), "unrelated");
+  assert.equal(payments.judgeReceipt({ status: "0x0", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 10_000_000n })] }, expected), "failed");
+  assert.equal(payments.judgeReceipt(null, expected), "pending");
+  // a transfer of a different token shape — two indexed topics but no data — is not matched
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [{ address: payments.USDC_CONTRACT, topics: [payments.TRANSFER_TOPIC, "0x" + "11".repeat(32), "0x" + "22".repeat(32)] }] }, expected), "unrelated");
+});
+
+test("verification refuses a receipt from the wrong chain without asking for it", async () => {
+  const invoice = { address: payments.newReceivingAddress(), amountMicroUsdc: "10000000" };
+  const outcome = await payments.verifyPayment({ fetchImpl: stubFetch({ chainId: 1 }), rpcUrl: "http://localhost:1", txHash: "0x" + "ab".repeat(32), invoice });
+  assert.equal(outcome, "wrong-chain");
+});
+
+test("limits follow the account's paid state and degrade back to free", () => {
+  const now = 1_700_000_000_000;
+  const free = { id: "a" };
+  assert.equal(payments.limitsFor(free, now).tier, "free");
+  const paid = { id: "b", plan: { tier: "paid", paidUntil: now + 1000 } };
+  const lifted = payments.limitsFor(paid, now);
+  assert.equal(lifted.tier, "paid");
+  assert.equal(lifted.totalBytes, payments.PLANS.paid.totalBytes);
+  // 30 days after the payment, the same account reads as free again
+  assert.equal(payments.limitsFor(paid, now + 1001).tier, "free");
+  // a malformed record degrades to free instead of crashing or lying
+  assert.equal(payments.limitsFor({ id: "c", plan: { tier: "paid", paidUntil: "soon" } }, now).tier, "free");
+  // paying again stacks 30 days on top of what is left, not on top of now
+  const renewed = { id: "d", plan: { tier: "paid", paidUntil: now + 10 * 24 * 60 * 60 * 1000 } };
+  assert.equal(payments.extendPaid(renewed, now), now + 40 * 24 * 60 * 60 * 1000);
+});
+
+test("invoices: one transaction pays one invoice, stale ones expire", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-invoices-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+  const invoice = await ledger.create("account-1");
+  assert.equal(invoice.status, "pending");
+  assert.match(invoice.address, /^0x[0-9a-f]{40}$/);
+  assert.equal(ledger.find(invoice.id).accountId, "account-1");
+  // replay protection across accounts
+  invoice.txHash = "0x" + "cd".repeat(32);
+  await ledger.save();
+  // a fresh module reads the same invoice — and its transaction — back from disk
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.find(invoice.id).address, invoice.address);
+  assert.equal(reopened.findByTx(invoice.txHash).id, invoice.id);
+  assert.equal(reopened.findByTx("0x" + "ee".repeat(32)), null);
+  // staleness
+  invoice.expiresAt = 1; // long past
+  const other = await ledger.create("account-2");
+  await ledger.expireStale(Date.now());
+  assert.equal(ledger.find(invoice.id).status, "expired");
+  assert.equal(ledger.find(other.id).status, "pending");
+});
+
+// --- payments: through the API ---------------------------------------------
+
+const TX_HASH = "0x" + "a7".repeat(32);
+
+async function payInvoice(token, invoice, { receipt, chainId } = {}) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stubFetch({ receipt, chainId });
+  try {
+    return await request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: TX_HASH }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` }
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+test("a verified test-USDC payment lifts the account to the paid plan", async () => {
+  const acct = await makeAccount("payer@example.com");
+
+  // the free cap bites first: this suite's free plan holds 2 clips
+  await uploadClip(acct.token, { bytes: 4096 });
+  await uploadClip(acct.token, { bytes: 4096 });
+  assert.equal((await uploadClip(acct.token, { bytes: 4096 })).res.status, 403);
+
+  // an invoice names a fresh address, the exact price and the test network
+  const invRes = await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } });
+  assert.equal(invRes.status, 201);
+  const invoice = JSON.parse(invRes.body);
+  assert.match(invoice.payTo, /^0x[0-9a-f]{40}$/);
+  assert.equal(invoice.amountMicroUsdc, "10000000");
+  assert.equal(invoice.amountUsdc, "10.00");
+  assert.equal(invoice.test, true);
+  assert.equal(invoice.chainId, payments.CHAIN_ID);
+  assert.equal(invoice.contract, payments.USDC_CONTRACT);
+
+  // malformed hashes are refused before any network call
+  const bad = await request("POST", "/api/billing/verify", {
+    body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: "0x1234" }),
+    headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+  });
+  assert.equal(bad.status, 400);
+
+  // another account's invoice is not mine to verify
+  const other = await makeAccount("other-payer@example.com");
+  const otherInv = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${other.token}` } })).body);
+  assert.equal((await payInvoice(acct.token, otherInv, { receipt: {} })).status, 404);
+
+  // not mined yet: answered as pending, the plan does not move
+  const pending = await payInvoice(acct.token, invoice, { receipt: null });
+  assert.equal(pending.status, 200);
+  assert.equal(JSON.parse(pending.body).status, "pending");
+
+  // mined but reverted
+  assert.equal((await payInvoice(acct.token, invoice, { receipt: { status: "0x0", logs: [] } })).status, 402);
+  // the right shape, the wrong amount
+  const shortPaid = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 5_000_000n })] };
+  const short = await payInvoice(acct.token, invoice, { receipt: shortPaid });
+  assert.equal(short.status, 402);
+  assert.match(JSON.parse(short.body).error, /amount/i);
+  // money to the wrong address
+  const elsewhere = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: payments.newReceivingAddress(), microUsdc: 10_000_000n })] };
+  assert.equal((await payInvoice(acct.token, invoice, { receipt: elsewhere })).status, 402);
+
+  // the real thing
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+  const paid = await payInvoice(acct.token, invoice, { receipt });
+  assert.equal(paid.status, 200);
+  const paidBody = JSON.parse(paid.body);
+  assert.equal(paidBody.status, "paid");
+  assert.equal(paidBody.tier, "paid");
+  assert.ok(paidBody.paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000);
+
+  // the plan reads back as paid with the paid limits
+  const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  assert.equal(mine.plan, "paid");
+  assert.equal(mine.limits.maxClips, 50); // as shrunk by env for this suite
+  assert.equal(mine.limits.totalBytes, 13 * 1024);
+
+  // recording works again: two more clips fit in the paid total, the third hits it
+  assert.equal((await uploadClip(acct.token, { bytes: 2048 })).res.status, 201);
+  assert.equal((await uploadClip(acct.token, { bytes: 2048 })).res.status, 201);
+  const fifth = await uploadClip(acct.token, { bytes: 2048 });
+  // 2 × 4096 + 3 × 2048 = 14336 bytes would exceed the 13312-byte paid total in this suite
+  assert.equal(fifth.res.status, 413);
+  assert.match(JSON.parse(fifth.res.body).error, /total/i);
+
+  // the plan survives a fresh session token (it lives on the account)
+  const again = JSON.parse((await request("POST", "/api/sessions", {
+    body: JSON.stringify({ email: "payer@example.com", password: "correct horse battery" }),
+    headers: { "content-type": "application/json" }
+  })).body);
+  const reMe = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${again.token}` } })).body);
+  assert.equal(reMe.plan, "paid");
+
+  // idempotent re-verify of the same invoice answers with the plan, not an error
+  const twice = await payInvoice(acct.token, invoice, { receipt });
+  assert.equal(twice.status, 200);
+  assert.equal(JSON.parse(twice.body).alreadyPaid, true);
+
+  // replay protection: the same transaction cannot pay a second invoice
+  const inv2 = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const replay = await payInvoice(acct.token, inv2, { receipt });
+  assert.equal(replay.status, 402);
+  assert.match(JSON.parse(replay.body).error, /already used/i);
+});
+
+test("billing routes need an account", async () => {
+  assert.equal((await request("POST", "/api/billing/invoices")).status, 401);
+  assert.equal((await request("POST", "/api/billing/verify", { body: JSON.stringify({}), headers: { "content-type": "application/json" } })).status, 401);
+  assert.equal((await request("GET", "/api/billing/status")).status, 401);
+  // but the public overview needs nobody
+  assert.equal((await request("GET", "/api/billing")).status, 200);
+});
 
 after(() => new Promise((resolve) => server.close(() => resolve())));

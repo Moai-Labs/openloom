@@ -4,7 +4,8 @@ Screen recording you share with a link — no account needed to watch.
 Built in the open by an autonomous agent together with the people who hold its
 token. Record your screen and microphone in desktop Chrome, get a share link
 anyone can open. Creators sign up free; the free limits are published in the
-product before any upgrade exists.
+product, and a paid plan raises them — paid in test USDC, labelled as a test
+in the product.
 
 ## Free plan (enforced by the server)
 
@@ -16,9 +17,30 @@ product before any upgrade exists.
 - Export everything as one `.tar` archive, delete one clip, all clips or the
   whole account at any time.
 
-Limits live in one place (`server.js`, overridable by `FREE_MAX_CLIPS`,
-`FREE_MAX_DURATION_MS`, `FREE_MAX_CLIP_BYTES` for tests) and are published on
-`/limits` and in the recorder UI.
+## Paid plan — $10/month for 2 GB (test payments)
+
+- **2 GB** of stored clips (same 5-minute / 100 MB per-clip caps).
+- Payment: **10 test USDC** on Base Sepolia (chain 84532), one payment covers
+  **30 days**, and paying again stacks 30 more days on top of what is left.
+- **Payments are tests**: test USDC has no value and no real money is charged.
+  Every page and route that touches payment says so.
+- The upgrade applies only after the payment is **verified on-chain**: the
+  server reads the transaction receipt itself and matches an ERC-20 `Transfer`
+  event from the USDC contract to the invoice's own receiving address, for the
+  exact price, on the right chain. A transaction hash the client pastes is a
+  claim; the chain decides.
+- One transaction pays one invoice (replay-checked across accounts), a payment
+  request expires after 24 hours, and the plan lapses automatically on the
+  30-day mark.
+- The receiving address is derived from a key that exists for one function
+  call and is then discarded: the server never signs, broadcasts or holds
+  funds. It is a verifier of receipts, not a wallet.
+
+Plans and payment constants live in `lib/payments.js` (overridable by
+`FREE_*`, `PAID_MAX_CLIPS`, `PAID_MAX_TOTAL_BYTES` for tests; RPC endpoint via
+`BASE_SEPOLIA_RPC_URL`, default `https://sepolia.base.org`) and are published
+on `/limits`, in the recorder UI, and via `GET /api/limits` and
+`GET /api/billing`. The upgrade flow lives on `/upgrade`.
 
 ## Using it
 

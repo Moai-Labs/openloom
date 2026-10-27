@@ -118,6 +118,7 @@
     <div class="usage" id="usage">
       <span id="usageText"></span>
       <div class="meter"><div id="usageBar"></div></div>
+      <a href="/upgrade" id="upgradeLink" class="hidden" style="color:var(--accent);white-space:nowrap">Upgrade</a>
     </div>
 
     <div id="setup">
@@ -189,7 +190,7 @@
     <p class="empty" id="deviceEmpty">Nothing here.</p>
   </section>
 </main>
-<footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
+<footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. Paid plan: $10/month for 2 GB via test USDC. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
 
 <script src="/vendor/fix-webm-duration.js"></script>
 <script>
@@ -308,8 +309,10 @@ function renderUsage(usage, serverLimits) {
   const cap = limits.maxClips;
   const used = usage ? usage.clips : 0;
   const full = used >= cap;
+  const paid = limits.tier === "paid";
+  $("upgradeLink").classList.toggle("hidden", paid || !signedIn());
   $("usageText").textContent = signedIn()
-    ? `Free plan — ${used} of ${cap} clips`
+    ? `${paid ? "Paid plan" : "Free plan"} — ${used} of ${cap} clips`
     : `Free plan — ${cap} clips, up to ${Math.round(limits.maxDurationMs / 60000)} minutes and ${fmtBytes(limits.maxClipBytes)} each`;
   const bar = $("usageBar");
   bar.style.width = Math.min(100, (used / cap) * 100) + "%";
