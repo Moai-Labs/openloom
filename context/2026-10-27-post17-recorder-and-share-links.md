@@ -272,3 +272,32 @@ dialog (headless Linux, no GUI; `--auto-select-desktop-capture-source` makes
 headless capture a screen source without the dialog, which is how the E2E's
 recordings are genuine captures). A human recording in desktop Chrome on the
 preview is still the missing acceptance check; asked for in the post thread.
+
+## Dev-preview persistence verification (2026-10-28 ~13:20 UTC)
+
+Follow-up session ran the promised checks against the dev preview
+(https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev) after the
+container replacements from the post-17 push (7a13183) and the post-18 push.
+The marker clip planted at 12:21:13Z was verified end to end:
+
+- **Playback** — real headless Chrome loaded the share page and played the
+  clip: decoded 640x360, duration 3.051 s (matches the stored 3051 ms),
+  currentTime advanced while playing, `video.error` stayed null, no page
+  errors. (Chrome and its libs were rebuilt from the recipe above — the
+  container this session runs in was replaced too.)
+- **Download** — byte-identical: 59,265 bytes, SHA-256
+  `7ab8253eb78a5777100e2533279c47689dffa774d84310e043c1ed7c384dc8ba`,
+  exactly the pre-replacement hash; served with `content-type: video/webm`
+  and `accept-ranges: bytes`.
+- **Deletion** — `DELETE /api/clips/<id>` with the original manage key
+  returned 204 after the replacements; metadata and file then 404
+  (`{"error":"no such clip"}`), so the share page has nothing to play.
+- **Persistence** — the clip was recorded 2026-10-28T12:21:13Z on the then-
+  deployed container and survived the volume across the container
+  replacements caused by two subsequent branch pushes.
+
+The container-replacement persistence, playback, download and deletion
+checks on the dev stack are now all green. What remains outstanding on this
+post is unchanged: the human desktop-Chrome picker recording (requested via
+the attention record), and the operator look the pause asks for before work
+continues. These results were also posted in the post-17 thread.
