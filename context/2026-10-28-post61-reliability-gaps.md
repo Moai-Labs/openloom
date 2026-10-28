@@ -5,10 +5,40 @@ session, d8b52f1). The final free-plan review finding was reproduced against
 current main and fixed on this branch.
 
 **Acceptance status: not complete.** What is done and what remains is listed
-per evidence run below. Two items cannot be produced from this lane until the
-platform merges this branch — the deployed-revision run on the fixed scanner,
-and the human desktop-Chrome confirmation (a person, not the agent) — and the
-document says precisely where each stands rather than claiming either.
+per evidence run below. Two items cannot be produced from this lane on its
+own — the deployed-revision run on the fixed scanner (blocked on the
+platform merging this branch) and the human desktop-Chrome confirmation
+(blocked on a person completing the team request, due 2026-10-29T18:00Z) —
+and the document says precisely where each stands rather than claiming
+either.
+
+## Review round 3 changes (2026-10-28, this session)
+
+- `e2e/record.mjs`: remote-test account handling rewritten for isolation.
+  The suite's fixed emails and shared password are gone; every account now
+  comes from a per-run generated identity (unique email, unique random
+  password, recorded at mint), the fixed-account pre-clean and the sign-in
+  fallback are removed, and remote cleanup moved into a `finally` block that
+  deletes only accounts whose credentials this run generated — failed runs
+  clean up after themselves and nothing pre-existing on a shared stack can
+  ever match. See the run B section below.
+- Local re-run after the rewrite: **50 checks, 0 failed** (run A below,
+  same revision); API suite still 92/92. The next remote run against the
+  dev preview uses these identities and cleans them up in the finally block.
+- Verified the failure path directly (2026-10-28 21:15 UTC): the suite ran
+  in remote mode against a local server behind a proxy that refuses `/v/`
+  share pages, with a pre-existing account (created before the run, under
+  credentials the run never sees) alongside. The run failed at the viewer
+  step as designed; the finally block signed each of the nine recorded
+  identities back in and deleted exactly those nine accounts (nine `POST
+  /api/sessions` + nine `DELETE /api/my/account` in the server log, one per
+  run identity) — the pre-existing account was never signed into or
+  deleted, and no account survived the failed run.
+
+The human real-Chrome confirmation the review asks to publish is still
+outstanding with the team and cannot be produced by this lane; its state,
+the preview revision it should run against, and what stays assigned to
+platform-coordinated follow-up are in the real-Chrome section below.
 
 ## The bug: a sibling-terminated unknown-size cluster was dropped silently
 
@@ -109,23 +139,26 @@ run is tied to the deployed revision **as it is**: main 2d13f83, whose
 scanner does not yet carry the fix — so it is stack evidence, not evidence
 for this branch's fix, and post-61's acceptance does not claim it.
 
-Three test-only changes were needed to make remote runs safe on a shared
-stack, all added this session:
+Three test-only properties make remote runs safe on a shared stack; the
+first two were rewritten after review round 3, which correctly flagged the
+fixed-credential cleanup as unsafe:
 
-- Step 0 pre-clean: the suite's fixed accounts (author@example.com and the
-  others) survive from an earlier suite run — a 12:16 UTC run had left
-  author@example.com full at 3 clips, which disables Start recording and
-  failed the first remote attempt at "Record another". The suite now signs
-  each fixed account in (only the suite's own password matches) and deletes
-  the account before the checks, so a reused dev stack starts clean.
-- Step 15 cleanup: after the checks, every fixed account is signed in again
-  by password and deleted, clips and all, so a shared-stack run leaves
-  nothing behind for the holders post-62 is inviting. The first version used
-  the tokens captured at sign-up and missed two accounts whose sessions the
-  account-switch scenarios had signed out mid-suite (401 on delete) — the
-  final version re-authenticates by password, and the accounts the interim
-  version missed on the preview were removed the same way right after. Only
-  accounts that authenticate with the suite's own password are ever removed.
+- Per-run identities: every account the suite touches is created by the run
+  itself under an email and password generated for that run alone
+  (nine roles: author, stranger, successor, resultauthor, resultnext,
+  switchauthor, switchnext, pendingowner, afterpending, each suffixed with a
+  random id and each with its own random password). There is no fixed
+  pre-clean of known accounts any more and no sign-in fallback in `signUp` —
+  an old run's leftover accounts (or anyone else's data on the shared stack)
+  simply never collide with this run's identities, and a successful
+  authentication with a run-recorded credential is itself the proof that the
+  account belongs to this run.
+- Cleanup in a finally block: after the suite — on success or on failure —
+  every recorded identity is signed back in and the account deleted, clips
+  and all. Only accounts that authenticate with a credential this run
+  generated are removed; pre-existing accounts cannot match. Failed runs no
+  longer leave test accounts behind, and nothing is deleted that the run did
+  not create.
 - "Delete everything" is already scoped to the signed-in account
   (`removeAllFor(account.id)`), so nobody else's data is ever touched —
   verified by the run itself: the first remote attempt's clip was the only
@@ -154,19 +187,29 @@ then also the deployed one).
 ## Real-Chrome picker check — pending with the team, not done
 
 Recorded as an attention request on post 61 (`real-chrome-picker-check`,
-due 2026-10-29T18:00Z): real desktop Chrome, real screen picker +
-microphone on the dev preview, then viewer playback, byte-identical
-download and author deletion. Re-pinged in the thread this session with a
-note that the current preview is valid for it — picker, microphone,
-playback, download and deletion behave identically on the deployed and
-branched revisions; only the duration readout differs (the pre-fix scanner
-under-measures multi-cluster recordings, which is this branch's fix).
+due 2026-10-29T18:00Z, open as of this session): real desktop Chrome, real
+screen picker + microphone on the dev preview, then viewer playback,
+byte-identical download and author deletion. The dev preview to use is the
+one running main **2d13f83** at https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev
+— picker, microphone, playback, download and deletion behave identically on
+the deployed and branched revisions; only the duration readout differs (the
+pre-fix scanner under-measures multi-cluster recordings, which is this
+branch's fix).
 
-This container has no screen, no microphone and no way to operate the real
-picker dialog, so the agent cannot perform this check; headless Chrome's
-synthetic-capture path is not a substitute and is not counted as it. Until
-a person completes it and the evidence is recorded, post 61's acceptance
-stays incomplete, whatever else passes.
+This check is a human confirmation and is kept distinct from every
+synthetic headless result in this document: the container has no screen, no
+microphone and no way to operate the real picker dialog, and the agent's
+headless runs (synthetic capture source, auto-selected by Chrome flags) are
+not a substitute and are not counted as it. Until a person completes it and
+the evidence is recorded here and in the post's thread, post 61's
+acceptance stays incomplete, whatever else passes.
+
+What remains after it, and what cannot be produced from this lane before
+the platform acts: acceptance on a *fixed-revision deployed preview* (the
+scanner fix plus the full recorder suite against it) is platform-
+coordinated follow-up — the dev preview deploys main only, so it serves the
+fix only after the platform merges this branch. That limitation is
+recorded, not resolved, here.
 
 ## Completion plan once the platform merges this branch
 
