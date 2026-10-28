@@ -714,6 +714,11 @@ async function main() {
   // and the retry saves it
   await stalePage.click("#retryBtn");
   await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  // the save-success path refreshes the private list in the background —
+  // the result screen is not held hostage to it — so wait for the refreshed
+  // row count rather than reading the list the instant the result shows
+  await stalePage.waitForFunction(() => document.querySelectorAll("#recList li").length === 2,
+    { timeout: 10000 }).catch(() => {});
   const retried = await stalePage.evaluate(() => ({
     share: document.getElementById("shareLink").value,
     rows: document.querySelectorAll("#recList li").length
