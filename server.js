@@ -11,21 +11,20 @@ const { Store, UploadTooLarge } = require("./lib/store");
 const { Accounts } = require("./lib/accounts");
 const { createTar } = require("./lib/tar");
 const { scanWebmDurationFile } = require("./lib/webm-duration");
+const payments = require("./lib/payments");
 
 const port = Number(process.env.PORT ?? 3000); // 0 is allowed: tests pick an ephemeral port
 const dataDir = process.env.DATA_DIR || path.join(__dirname, "data");
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES) || 200 * 1024 * 1024;
 
-// The free plan, published in the product before any upgrade exists.
-// Env overrides exist so tests can exercise the limits without real payloads.
-const limits = {
-    maxClips: Number(process.env.FREE_MAX_CLIPS) || 3,
-    maxDurationMs: Number(process.env.FREE_MAX_DURATION_MS) || 5 * 60 * 1000,
-    maxClipBytes: Number(process.env.FREE_MAX_CLIP_BYTES) || 100 * 1024 * 1024
-};
+// The plans and their limits live in lib/payments.js — the free plan is what
+// the product enforces today, the paid plan is what a verified test-USDC
+// payment buys. Env overrides for tests live there too.
+const rpcUrl = process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org";
 
 const store = new Store(dataDir);
 const accounts = new Accounts(dataDir);
+const invoices = new payments.Invoices(dataDir);
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -42,6 +41,16 @@ function sendJson(res, status, body) {
 
 function sendError(res, status, message) {
     sendJson(res, status, { error: message });
+}
+
+// A storage cap in words, the way the product publishes it: "2 GB", not a
+// raw byte count. Small values round up so a test-sized cap never reads "0 MB".
+function storageCap(bytes) {
+    if (bytes >= 1024 ** 3) {
+        const gb = Math.round((bytes / 1024 ** 3) * 10) / 10;
+        return `${gb} GB`;
+    }
+    return `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`;
 }
 
 // Reads a small JSON body (accounts, never uploads).
@@ -151,36 +160,42 @@ async function createClip(req, res) {
         return;
     }
 
+    const plan = payments.limitsFor(account);
+    const tierName = plan.tier === "paid" ? "the paid plan" : "the free plan";
+
     const lengthHeader = Number(req.headers["content-length"]);
     if (Number.isFinite(lengthHeader) && lengthHeader > maxUploadBytes) {
         sendError(res, 413, "recording is too large to store");
         return;
     }
-    if (Number.isFinite(lengthHeader) && lengthHeader > limits.maxClipBytes) {
-        sendError(res, 413, `the free plan stores clips up to ${Math.floor(limits.maxClipBytes / (1024 * 1024))} MB — this one is larger`);
+    if (Number.isFinite(lengthHeader) && lengthHeader > plan.maxClipBytes) {
+        sendError(res, 413, `${tierName} stores clips up to ${Math.floor(plan.maxClipBytes / (1024 * 1024))} MB — this one is larger`);
         return;
     }
 
-    const used = await store.countByAccount(account.id);
-    if (used >= limits.maxClips) {
-        sendError(res, 403, `the free plan holds ${limits.maxClips} clips — delete one to record another`);
+    const stored = await store.listByAccount(account.id);
+    const used = stored.length;
+    const usedBytes = stored.reduce((n, c) => n + (c.bytes || 0), 0);
+    if (used >= plan.maxClips) {
+        sendError(res, 403, `${tierName} holds ${plan.maxClips} clips — delete one to record another`);
+        return;
+    }
+    if (Number.isFinite(lengthHeader) && usedBytes + lengthHeader > plan.totalBytes) {
+        sendError(res, 413, `${tierName} stores up to ${storageCap(plan.totalBytes)} in total — delete clips or upgrade to make room`);
         return;
     }
 
     const title = decodeTitle(req.headers["x-title"]);
     const durationMs = Number(req.headers["x-duration-ms"]);
     const declaredDuration = Number.isFinite(durationMs) ? durationMs : null;
-    // a fast pre-upload rejection of grossly over-cap declarations; the
-    // recorder's own auto-stop runs a beat past the cap (timer granularity),
-    // so the same slop as the real check below applies here
-    if (declaredDuration !== null && declaredDuration > limits.maxDurationMs + 2000) {
-        sendError(res, 413, `the free plan stores clips up to ${Math.round(limits.maxDurationMs / 60000)} minutes — this one is longer`);
+    if (declaredDuration !== null && declaredDuration > plan.maxDurationMs) {
+        sendError(res, 413, `${tierName} stores clips up to ${Math.round(plan.maxDurationMs / 60000)} minutes — this one is longer`);
         return;
     }
     const filename = safeFilename(title, contentType);
 
     const { meta, manageToken } = await store.createFromStream(req, {
-        maxBytes: Math.min(maxUploadBytes, limits.maxClipBytes),
+        maxBytes: Math.min(maxUploadBytes, plan.maxClipBytes),
         contentType,
         filename,
         title,
@@ -205,9 +220,9 @@ async function createClip(req, res) {
             sendError(res, 413, "the recording's length could not be verified from the file itself, so the free plan cannot store it");
             return;
         }
-        if (verified > limits.maxDurationMs + 2000) { // small encoder slop
+        if (verified > plan.maxDurationMs + 2000) { // small encoder slop
             await store.remove(meta.id, { token: manageToken });
-            sendError(res, 413, `the free plan stores clips up to ${Math.round(limits.maxDurationMs / 60000)} minutes — this one runs ${Math.round(verified / 60000)}`);
+            sendError(res, 413, `${tierName} stores clips up to ${Math.round(plan.maxDurationMs / 60000)} minutes — this one runs ${Math.round(verified / 60000)}`);
             return;
         }
         // the timeline is the truth, even when the declared header disagrees
@@ -216,10 +231,16 @@ async function createClip(req, res) {
     }
 
     // Recount after the write: two concurrent uploads must not sneak past the cap.
-    const afterCount = await store.countByAccount(account.id);
-    if (afterCount > limits.maxClips) {
+    const after = await store.listByAccount(account.id);
+    if (after.length > plan.maxClips) {
         await store.remove(meta.id, { token: manageToken });
-        sendError(res, 403, `the free plan holds ${limits.maxClips} clips — delete one to record another`);
+        sendError(res, 403, `${tierName} holds ${plan.maxClips} clips — delete one to record another`);
+        return;
+    }
+    const afterBytes = after.reduce((n, c) => n + (c.bytes || 0), 0);
+    if (afterBytes > plan.totalBytes) {
+        await store.remove(meta.id, { token: manageToken });
+        sendError(res, 413, `${tierName} stores up to ${storageCap(plan.totalBytes)} in total — delete clips or upgrade to make room`);
         return;
     }
 
@@ -337,9 +358,12 @@ async function logout(req, res) {
 
 async function me(req, res, account) {
     const clips = await store.listByAccount(account.id);
+    const plan = payments.limitsFor(account);
     sendJson(res, 200, {
         email: account.email,
-        limits,
+        plan: plan.tier,
+        paidUntil: plan.paidUntil || null,
+        limits: plan,
         usage: {
             clips: clips.length,
             bytes: clips.reduce((n, c) => n + (c.bytes || 0), 0)
@@ -356,6 +380,145 @@ async function listMyClips(req, res, account) {
         createdAt: c.createdAt
     }));
     sendJson(res, 200, { clips });
+}
+
+// ---------------------------------------------------------------------------
+// Billing: the paid plan, paid in test USDC on Base Sepolia
+
+// What a payment buys, published in one place and served to every page. The
+// free plan's limits stay at the top level, as they were before upgrades
+// existed, so nothing that reads them has to change.
+function billingInfo() {
+    return {
+        plan: "free",
+        ...payments.PLANS.free,
+        test: true,
+        notice: "Payments are test USDC on a test network (Base Sepolia). Test tokens have no value and no real money is charged — this is a payment test.",
+        priceUsd: payments.PRICE_USDC,
+        priceMicroUsdc: payments.PRICE_MICRO_USDC.toString(),
+        allowanceBytes: payments.PLANS.paid.totalBytes,
+        daysPerPayment: 30,
+        chainId: payments.CHAIN_ID,
+        contract: payments.USDC_CONTRACT,
+        paidPlan: {
+            tier: "paid",
+            maxClips: payments.PLANS.paid.maxClips,
+            totalBytes: payments.PLANS.paid.totalBytes
+        }
+    };
+}
+
+async function billingOverview(req, res) {
+    sendJson(res, 200, billingInfo());
+}
+
+async function createInvoice(req, res, account) {
+    await invoices.expireStale();
+    const invoice = await invoices.create(account.id);
+    sendJson(res, 201, {
+        invoiceId: invoice.id,
+        test: true,
+        notice: billingInfo().notice,
+        payTo: invoice.address,
+        amountUsdc: (Number(invoice.amountMicroUsdc) / 1e6).toFixed(2),
+        amountMicroUsdc: invoice.amountMicroUsdc,
+        chainId: payments.CHAIN_ID,
+        contract: payments.USDC_CONTRACT,
+        expiresAt: invoice.expiresAt
+    });
+}
+
+// The plan's live paidUntil as the committed state holds it right now —
+// not the snapshot the request started with, which a concurrent verify may
+// already have moved past. It reads after publish, so it never observes an
+// uncommitted plan, and it changes nothing: an extension happens only on
+// the one path per invoice whose markPaid finalized the payment.
+function livePaidUntil(accountId) {
+    const current = accounts.peek(accountId);
+    return current ? payments.activePaidUntil(current) : null;
+}
+
+async function verifyInvoicePayment(req, res, account) {
+    const body = await readJsonBody(req);
+    const invoiceId = body && body.invoiceId;
+    const txHash = body && body.txHash;
+    if (typeof txHash !== "string" || !payments.TX_HASH_PATTERN.test(txHash)) {
+        sendError(res, 400, "paste the transaction hash — 0x followed by 64 hex characters");
+        return;
+    }
+    const invoice = invoices.find(invoiceId);
+    if (!invoice || invoice.accountId !== account.id) {
+        sendError(res, 404, "no such payment request");
+        return;
+    }
+    if (invoice.status === "paid") {
+        // Idempotent: verifying the same invoice twice answers with the plan,
+        // not an error. A retry is also where a payment whose plan never
+        // landed is healed — applying the entitlement is exactly once, so a
+        // retry grants nothing the payment has not already bought.
+        try {
+            await payments.ensureEntitlement({ accounts, invoice });
+        } catch {
+            sendError(res, 503, "your payment is recorded — the plan could not be applied just now; try again in a moment");
+            return;
+        }
+        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: livePaidUntil(account.id), alreadyPaid: true, test: true });
+        return;
+    }
+    if (invoice.status === "expired") {
+        sendError(res, 410, "this payment request expired — start a new one");
+        return;
+    }
+    const reused = invoices.findByTx(txHash);
+    if (reused && reused.id !== invoice.id) {
+        sendError(res, 402, "this transaction was already used for another payment request");
+        return;
+    }
+
+    let outcome;
+    try {
+        outcome = await payments.verifyPayment({ fetchImpl: fetch, rpcUrl, txHash, invoice });
+    } catch {
+        sendError(res, 502, "could not reach the payment network — try again in a moment");
+        return;
+    }
+
+    if (outcome !== "verified") {
+        const reasons = {
+            pending: { status: 200, text: "no receipt on-chain yet — wait for the transaction to be mined, then try again" },
+            failed: { status: 402, text: "that transaction was mined but did not succeed" },
+            unrelated: { status: 402, text: "that transaction does not send test USDC to this payment request's address" },
+            "wrong-amount": { status: 402, text: "the amount does not match — the plan costs 10 test USDC" },
+            "wrong-chain": { status: 402, text: "that transaction is on a different chain — pay on Base Sepolia" }
+        };
+        const reason = reasons[outcome] || { status: 402, text: "the payment could not be verified" };
+        sendJson(res, reason.status, { status: outcome, error: reason.text, test: true });
+        return;
+    }
+
+    // Verified: one transaction pays one invoice, and the plan starts now.
+    // markPaid serializes against every other invoice mutation and re-checks
+    // everything inside the lock — a concurrent verify of the same receipt
+    // answers already-paid here so the plan is not extended twice, a hash
+    // another invoice already took is refused, and an invoice that expired
+    // while the verification was on the wire is not paid.
+    const { already, invoice: paid } = await invoices.markPaid(invoice.id, { txHash: txHash.toLowerCase(), paidAt: Date.now() });
+    // The entitlement applies through the same idempotent operation a retry
+    // and startup reconciliation use, so the two commits can no longer
+    // strand a payment: the account snapshot records the invoice next to
+    // the paidUntil it bought, and if this commit fails the invoice is
+    // still durably paid — the next verify of it, or the next boot, grants
+    // the 30 days with their original timing, exactly once.
+    let paidUntil;
+    try {
+        paidUntil = await payments.ensureEntitlement({ accounts, invoice: paid });
+    } catch {
+        sendError(res, 503, "your payment is verified and recorded, but the plan could not be applied just now — verify the same payment again in a moment and it will apply");
+        return;
+    }
+    const reply = { status: "paid", tier: "paid", paidUntil, test: true };
+    if (already) reply.alreadyPaid = true;
+    sendJson(res, 200, reply);
 }
 
 // One-time, short-lived links let the browser download the export with an
@@ -531,6 +694,11 @@ async function handle(req, res) {
         return;
     }
 
+    if (req.method === "GET" && u.pathname === "/upgrade") {
+        sendPage(res, "upgrade.html");
+        return;
+    }
+
     if (req.method === "GET" && parts[0] === "v" && parts.length === 2) {
         sendPage(res, "watch.html"); // the page itself explains a bad or missing clip
         return;
@@ -538,8 +706,31 @@ async function handle(req, res) {
 
     if (parts[0] === "api") {
         if (parts[1] === "limits" && req.method === "GET") {
-            sendJson(res, 200, { plan: "free", ...limits });
+            sendJson(res, 200, billingInfo());
             return;
+        }
+        if (parts[1] === "billing") {
+            if (req.method === "GET" && parts.length === 2) {
+                await billingOverview(req, res);
+                return;
+            }
+            const account = await accounts.auth(bearerToken(req));
+            if (!account) {
+                sendError(res, 401, "sign in first — the paid plan belongs to an account");
+                return;
+            }
+            if (req.method === "POST" && parts[2] === "invoices" && parts.length === 3) {
+                await createInvoice(req, res, account);
+                return;
+            }
+            if (req.method === "POST" && parts[2] === "verify" && parts.length === 3) {
+                await verifyInvoicePayment(req, res, account);
+                return;
+            }
+            if (req.method === "GET" && parts[2] === "status" && parts.length === 3) {
+                await me(req, res, account);
+                return;
+            }
         }
         if (parts[1] === "accounts" && req.method === "POST" && parts.length === 2) {
             await createAccount(req, res);
@@ -628,9 +819,21 @@ server.on("clientError", (err, socket) => {
 (async () => {
     await store.init();
     await accounts.init();
+    // Payment requests are persisted so a restart does not strand one —
+    // load them before anything reads the ledger.
+    await invoices.init();
+    // Finish any grant a crash interrupted: an invoice committed as paid
+    // but whose plan never landed. Idempotent — it grants nothing twice,
+    // and it restores the payment's original 30-day window.
+    const healed = await payments.reconcileEntitlements({ invoices, accounts });
+    if (healed.length > 0) {
+        console.log(`recovered ${healed.length} paid payment(s) whose plan had not been applied`);
+    }
     loadPage("recorder.html", "text/html; charset=utf-8");
     loadPage("watch.html", "text/html; charset=utf-8");
     loadPage("limits.html", "text/html; charset=utf-8");
+    loadPage("upgrade.html", "text/html; charset=utf-8");
+    loadStatic("/vendor/fix-webm-duration.js", "fix-webm-duration.js", "application/javascript; charset=utf-8");
     server.listen(port, () => console.log(`listening on ${server.address().port} — data in ${dataDir}`));
 })().catch((err) => {
     console.error("failed to start:", err);

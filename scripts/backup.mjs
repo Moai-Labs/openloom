@@ -31,12 +31,15 @@ async function listFiles(dir, base = dir) {
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const target = path.join(backupRoot, stamp);
 
-// what gets copied: accounts.json and everything under clips/ (never tmp/)
+// what gets copied: accounts.json, invoices.json and everything under clips/
+// (never tmp/)
 const sources = [];
-try {
-  await stat(path.join(dataDir, "accounts.json"));
-  sources.push("accounts.json");
-} catch { /* no accounts yet */ }
+for (const name of ["accounts.json", "invoices.json"]) {
+  try {
+    await stat(path.join(dataDir, name));
+    sources.push(name);
+  } catch { /* no such file yet */ }
+}
 try {
   const entries = await readdir(path.join(dataDir, "clips"));
   if (entries.length) sources.push("clips");

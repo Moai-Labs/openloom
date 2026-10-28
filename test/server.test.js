@@ -18,12 +18,16 @@ process.env.MAX_UPLOAD_BYTES = String(64 * 1024); // absolute guard, small so te
 process.env.FREE_MAX_CLIPS = "2";
 process.env.FREE_MAX_CLIP_BYTES = String(16 * 1024);
 process.env.FREE_MAX_DURATION_MS = "30000";
+// paid-plan limits, shrunk so tests exercise them without real payloads
+process.env.PAID_MAX_CLIPS = "50";
+process.env.PAID_MAX_TOTAL_BYTES = String(13 * 1024);
 
 const server = require("../server.js");
 const { Store } = require("../lib/store");
 const { Accounts } = require("../lib/accounts");
 const { readTar } = require("../lib/tar");
 const { readWebmDurationMs, WebmDurationScanner } = require("../lib/webm-duration");
+const payments = require("../lib/payments");
 
 // The server listens inside its own async boot; wait for the port.
 async function waitForListen() {
@@ -110,10 +114,11 @@ test("the limits page is published", async () => {
   assert.ok(html.includes("3 stored clips"));
   assert.ok(html.includes("5 minutes"));
   assert.ok(html.includes("100 MB"));
-  assert.ok(html.includes("not available yet"), "no upgrade is sold before it exists");
+  assert.ok(html.includes("test USDC"), "the paid plan says how it is paid");
+  assert.ok(!html.includes("not available yet"), "the paid plan is available now");
 });
 
-test("the limits API states the free plan", async () => {
+test("the limits API states the free plan and the paid plan", async () => {
   const res = await request("GET", "/api/limits");
   assert.equal(res.status, 200);
   const data = JSON.parse(res.body);
@@ -121,6 +126,18 @@ test("the limits API states the free plan", async () => {
   assert.equal(data.maxClips, 2); // as shrunk by env for this suite
   assert.equal(data.maxDurationMs, 30000);
   assert.equal(data.maxClipBytes, 16 * 1024);
+  assert.equal(data.priceUsd, 10);
+  assert.equal(data.paidPlan.totalBytes, 13 * 1024); // as shrunk by env for this suite
+  assert.equal(data.test, true);
+  assert.match(data.notice, /test/i);
+});
+
+test("the upgrade page is published and says payments are tests", async () => {
+  const res = await request("GET", "/upgrade");
+  assert.equal(res.status, 200);
+  const html = res.body.toString();
+  assert.ok(html.includes("test payment"), "the page labels the payment a test");
+  assert.ok(html.includes("2 GB"));
 });
 
 test("watch page is served at /v/<id>", async () => {
@@ -905,5 +922,963 @@ function sizeVint(value) {
   buf[0] = (v & (0xff >> (n - 1))) | (0x80 >> (n - 1));
   return buf;
 }
+
+// --- payments: unit level ---------------------------------------------------
+
+function transferLog({ contract, to, microUsdc }) {
+  return {
+    address: contract,
+    topics: [
+      payments.TRANSFER_TOPIC,
+      "0x" + Buffer.alloc(32).toString("hex"), // from — irrelevant to verification
+      "0x" + payments.pad32(payments.hexToBuffer(to)).toString("hex")
+    ],
+    data: "0x" + payments.amountTo32Bytes(microUsdc).toString("hex")
+  };
+}
+
+// A fetch replacement that answers JSON-RPC without touching a network.
+function stubFetch({ chainId = payments.CHAIN_ID, receipt = null } = {}) {
+  return async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(chainId).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+}
+
+test("receiving addresses are valid, checksum-free hex and never repeat", () => {
+  const seen = new Set();
+  for (let i = 0; i < 20; i++) {
+    const address = payments.newReceivingAddress();
+    assert.match(address, /^0x[0-9a-f]{40}$/);
+    assert.ok(!seen.has(address));
+    seen.add(address);
+  }
+});
+
+test("a receipt with the exact transfer verifies; the near misses do not", () => {
+  const to = payments.newReceivingAddress();
+  const expected = { contract: payments.USDC_CONTRACT, toAddress: to, topic0: payments.TRANSFER_TOPIC, expectedMicroUsdc: 10_000_000n };
+  const right = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 10_000_000n })] };
+  assert.equal(payments.judgeReceipt(right, expected), "verified");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 9_999_999n })] }, expected), "wrong-amount");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: payments.newReceivingAddress(), microUsdc: 10_000_000n })] }, expected), "unrelated");
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [transferLog({ contract: "0x" + "ab".repeat(20), to, microUsdc: 10_000_000n })] }, expected), "unrelated");
+  assert.equal(payments.judgeReceipt({ status: "0x0", logs: [transferLog({ contract: payments.USDC_CONTRACT, to, microUsdc: 10_000_000n })] }, expected), "failed");
+  assert.equal(payments.judgeReceipt(null, expected), "pending");
+  // a transfer of a different token shape — two indexed topics but no data — is not matched
+  assert.equal(payments.judgeReceipt({ status: "0x1", logs: [{ address: payments.USDC_CONTRACT, topics: [payments.TRANSFER_TOPIC, "0x" + "11".repeat(32), "0x" + "22".repeat(32)] }] }, expected), "unrelated");
+});
+
+test("verification refuses a receipt from the wrong chain without asking for it", async () => {
+  const invoice = { address: payments.newReceivingAddress(), amountMicroUsdc: "10000000" };
+  const outcome = await payments.verifyPayment({ fetchImpl: stubFetch({ chainId: 1 }), rpcUrl: "http://localhost:1", txHash: "0x" + "ab".repeat(32), invoice });
+  assert.equal(outcome, "wrong-chain");
+});
+
+test("limits follow the account's paid state and degrade back to free", () => {
+  const now = 1_700_000_000_000;
+  const free = { id: "a" };
+  assert.equal(payments.limitsFor(free, now).tier, "free");
+  const paid = { id: "b", plan: { tier: "paid", paidUntil: now + 1000 } };
+  const lifted = payments.limitsFor(paid, now);
+  assert.equal(lifted.tier, "paid");
+  assert.equal(lifted.totalBytes, payments.PLANS.paid.totalBytes);
+  // 30 days after the payment, the same account reads as free again
+  assert.equal(payments.limitsFor(paid, now + 1001).tier, "free");
+  // a malformed record degrades to free instead of crashing or lying
+  assert.equal(payments.limitsFor({ id: "c", plan: { tier: "paid", paidUntil: "soon" } }, now).tier, "free");
+  // paying again stacks 30 days on top of what is left, not on top of now
+  const renewed = { id: "d", plan: { tier: "paid", paidUntil: now + 10 * 24 * 60 * 60 * 1000 } };
+  assert.equal(payments.extendPaid(renewed, now), now + 40 * 24 * 60 * 60 * 1000);
+});
+
+test("invoices: one transaction pays one invoice, stale ones expire", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-invoices-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+  const invoice = await ledger.create("account-1");
+  assert.equal(invoice.status, "pending");
+  assert.match(invoice.address, /^0x[0-9a-f]{40}$/);
+  assert.equal(ledger.find(invoice.id).accountId, "account-1");
+  // replay protection across accounts
+  invoice.txHash = "0x" + "cd".repeat(32);
+  await ledger.save();
+  // a fresh module reads the same invoice — and its transaction — back from disk
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.find(invoice.id).address, invoice.address);
+  assert.equal(reopened.findByTx(invoice.txHash).id, invoice.id);
+  assert.equal(reopened.findByTx("0x" + "ee".repeat(32)), null);
+  // staleness
+  invoice.expiresAt = 1; // long past
+  const other = await ledger.create("account-2");
+  await ledger.expireStale(Date.now());
+  assert.equal(ledger.find(invoice.id).status, "expired");
+  assert.equal(ledger.find(other.id).status, "pending");
+});
+
+// --- payments: through the API ---------------------------------------------
+
+const TX_HASH = "0x" + "a7".repeat(32);
+
+async function payInvoice(token, invoice, { receipt, chainId, txHash = TX_HASH } = {}) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stubFetch({ receipt, chainId });
+  try {
+    return await request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` }
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+test("a verified test-USDC payment lifts the account to the paid plan", async () => {
+  const acct = await makeAccount("payer@example.com");
+
+  // the free cap bites first: this suite's free plan holds 2 clips
+  await uploadClip(acct.token, { bytes: 4096 });
+  await uploadClip(acct.token, { bytes: 4096 });
+  assert.equal((await uploadClip(acct.token, { bytes: 4096 })).res.status, 403);
+
+  // an invoice names a fresh address, the exact price and the test network
+  const invRes = await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } });
+  assert.equal(invRes.status, 201);
+  const invoice = JSON.parse(invRes.body);
+  assert.match(invoice.payTo, /^0x[0-9a-f]{40}$/);
+  assert.equal(invoice.amountMicroUsdc, "10000000");
+  assert.equal(invoice.amountUsdc, "10.00");
+  assert.equal(invoice.test, true);
+  assert.equal(invoice.chainId, payments.CHAIN_ID);
+  assert.equal(invoice.contract, payments.USDC_CONTRACT);
+
+  // malformed hashes are refused before any network call
+  const bad = await request("POST", "/api/billing/verify", {
+    body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: "0x1234" }),
+    headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+  });
+  assert.equal(bad.status, 400);
+
+  // another account's invoice is not mine to verify
+  const other = await makeAccount("other-payer@example.com");
+  const otherInv = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${other.token}` } })).body);
+  assert.equal((await payInvoice(acct.token, otherInv, { receipt: {} })).status, 404);
+
+  // not mined yet: answered as pending, the plan does not move
+  const pending = await payInvoice(acct.token, invoice, { receipt: null });
+  assert.equal(pending.status, 200);
+  assert.equal(JSON.parse(pending.body).status, "pending");
+
+  // mined but reverted
+  assert.equal((await payInvoice(acct.token, invoice, { receipt: { status: "0x0", logs: [] } })).status, 402);
+  // the right shape, the wrong amount
+  const shortPaid = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 5_000_000n })] };
+  const short = await payInvoice(acct.token, invoice, { receipt: shortPaid });
+  assert.equal(short.status, 402);
+  assert.match(JSON.parse(short.body).error, /amount/i);
+  // money to the wrong address
+  const elsewhere = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: payments.newReceivingAddress(), microUsdc: 10_000_000n })] };
+  assert.equal((await payInvoice(acct.token, invoice, { receipt: elsewhere })).status, 402);
+
+  // the real thing
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+  const paid = await payInvoice(acct.token, invoice, { receipt });
+  assert.equal(paid.status, 200);
+  const paidBody = JSON.parse(paid.body);
+  assert.equal(paidBody.status, "paid");
+  assert.equal(paidBody.tier, "paid");
+  assert.ok(paidBody.paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000);
+
+  // the plan reads back as paid with the paid limits
+  const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  assert.equal(mine.plan, "paid");
+  assert.equal(mine.limits.maxClips, 50); // as shrunk by env for this suite
+  assert.equal(mine.limits.totalBytes, 13 * 1024);
+
+  // recording works again: two more clips fit in the paid total, the third hits it
+  assert.equal((await uploadClip(acct.token, { bytes: 2048 })).res.status, 201);
+  assert.equal((await uploadClip(acct.token, { bytes: 2048 })).res.status, 201);
+  const fifth = await uploadClip(acct.token, { bytes: 2048 });
+  // 2 × 4096 + 3 × 2048 = 14336 bytes would exceed the 13312-byte paid total in this suite
+  assert.equal(fifth.res.status, 413);
+  assert.match(JSON.parse(fifth.res.body).error, /total/i);
+
+  // the plan survives a fresh session token (it lives on the account)
+  const again = JSON.parse((await request("POST", "/api/sessions", {
+    body: JSON.stringify({ email: "payer@example.com", password: "correct horse battery" }),
+    headers: { "content-type": "application/json" }
+  })).body);
+  const reMe = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${again.token}` } })).body);
+  assert.equal(reMe.plan, "paid");
+
+  // idempotent re-verify of the same invoice answers with the plan, not an error
+  const twice = await payInvoice(acct.token, invoice, { receipt });
+  assert.equal(twice.status, 200);
+  assert.equal(JSON.parse(twice.body).alreadyPaid, true);
+
+  // replay protection: the same transaction cannot pay a second invoice
+  const inv2 = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const replay = await payInvoice(acct.token, inv2, { receipt });
+  assert.equal(replay.status, 402);
+  assert.match(JSON.parse(replay.body).error, /already used/i);
+});
+
+test("billing routes need an account", async () => {
+  assert.equal((await request("POST", "/api/billing/invoices")).status, 401);
+  assert.equal((await request("POST", "/api/billing/verify", { body: JSON.stringify({}), headers: { "content-type": "application/json" } })).status, 401);
+  assert.equal((await request("GET", "/api/billing/status")).status, 401);
+  // but the public overview needs nobody
+  assert.equal((await request("GET", "/api/billing")).status, 200);
+});
+
+// --- concurrency: serialized persistence ------------------------------------
+// These pin the review findings: shared temporary filenames and unsynchronized
+// writes used to let overlapping operations corrupt accounts.json and
+// invoices.json, and a rejected upload used to delete every other upload's
+// staging file with the shared tmp directory.
+
+const { Accounts } = require("../lib/accounts");
+
+test("concurrent account operations persist one consistent store", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+
+  // 12 sign-ups, logins for those already made, and logouts, all fired at once.
+  const emails = Array.from({ length: 12 }, (_, i) => `concurrent-${i}@example.com`);
+  const jobs = emails.map((email) => ledger.create(email, "correct horse battery"));
+  const created = await Promise.all(jobs);
+  const tokens = created.map((made) => made.token);
+  // now logins and logouts over the live accounts, all at once
+  const overlapping = [
+    ...emails.slice(1).map((email) => ledger.login(email, "correct horse battery")),
+    ...tokens.slice(0, 4).map((token) => ledger.logout(token))
+  ];
+  const settled = await Promise.allSettled([...jobs, ...overlapping]);
+  for (const s of settled) assert.equal(s.status, "fulfilled", "no concurrent operation may fail: " + (s.reason && s.reason.message));
+
+  // A fresh instance reloads the same file: valid JSON, every account there.
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  for (const email of emails) {
+    assert.ok(reopened.data.accounts.some((a) => a.email === email), `${email} survived`);
+  }
+  // every session on disk still authenticates its account
+  const raw = fs.readFileSync(path.join(dir, "accounts.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  for (const token of tokens.slice(4)) {
+    assert.ok(await reopened.auth(token), "a live session still authenticates after the storm");
+  }
+  // and the logged-out ones no longer do
+  for (const token of tokens.slice(0, 4)) {
+    assert.equal(await reopened.auth(token), null);
+  }
+  // no temporary files were left behind
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("concurrent account operations survive a failing commit with state intact", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+  const made = await ledger.create("first@example.com", "correct horse battery");
+
+  // the next commits fail, as a full disk would
+  const realCommit = ledger.commit;
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const signup = await ledger.create("second@example.com", "correct horse battery").then(() => null, (err) => err);
+  assert.ok(signup, "the sign-up fails when its commit fails");
+  const logout = await ledger.logout(made.token).then(() => "changed", (err) => err);
+  assert.notEqual(logout, "changed", "the logout fails when its commit fails");
+
+  // memory rolled back to what is on disk, and the queue still works
+  assert.equal(ledger.data.accounts.length, 1, "the failed sign-up left no half-account");
+  ledger.commit = realCommit;
+  const third = await ledger.create("third@example.com", "correct horse battery");
+  assert.ok(third.token, "operations queued behind a failure still run");
+
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  assert.deepEqual(reopened.data.accounts.map((a) => a.email), ["first@example.com", "third@example.com"]);
+  assert.ok(await reopened.auth(made.token), "the failed logout did not drop the session on disk");
+});
+
+test("concurrent invoice creation and expiry persist every committed state", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  // two stale invoices to expire, then a storm of creations and expiries at once
+  const stale1 = await ledger.create("stale-account", Date.now() - 2 * payments.INVOICE_TTL_MS);
+  const stale2 = await ledger.create("stale-account", Date.now() - 2 * payments.INVOICE_TTL_MS);
+  const creations = Array.from({ length: 20 }, (_, i) => ledger.create(`account-${i % 3}`, Date.now() + i));
+  const expiries = Array.from({ length: 6 }, () => ledger.expireStale(Date.now()));
+  const settled = await Promise.allSettled([...creations, ...expiries]);
+  for (const s of settled) assert.equal(s.status, "fulfilled", "no concurrent invoice operation may fail: " + (s.reason && s.reason.message));
+
+  const created = (await Promise.all(creations)).map((i) => i.id);
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  const raw = fs.readFileSync(path.join(dir, "invoices.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  assert.equal(reopened.data.invoices.length, created.length + 2, "no invoice was lost across the restart");
+  for (const id of created) {
+    assert.ok(reopened.find(id), `invoice ${id} survived`);
+  }
+  // the two stale ones ended expired, exactly once, and nothing else moved
+  assert.equal(reopened.find(stale1.id).status, "expired");
+  assert.equal(reopened.find(stale2.id).status, "expired");
+  for (const id of created) {
+    assert.equal(reopened.find(id).status, "pending", "a fresh invoice is still pending");
+  }
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("a failing invoice commit rolls back and the queue keeps working", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  const realCommit = ledger.commit;
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const failed = await ledger.create("account-x").then(() => null, (err) => err);
+  assert.ok(failed, "creation fails when its commit fails");
+  assert.equal(ledger.data.invoices.length, 0, "the failed creation left no half-invoice");
+
+  ledger.commit = realCommit;
+  const ok = await ledger.create("account-x");
+  assert.ok(ok.id, "operations queued behind a failure still run");
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.data.invoices.length, 1);
+  assert.equal(reopened.find(ok.id).id, ok.id);
+});
+
+test("a valid upload survives concurrent empty and oversized uploads", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-store-conc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  await store.init();
+
+  const maxBytes = 16 * 1024;
+  const { PassThrough } = require("node:stream");
+
+  // A request whose body arrives in chunks with gaps, so it is still writing
+  // while the failures below finish — exactly the overlap that used to delete
+  // its staging file along with the shared tmp directory.
+  const payload = crypto.randomBytes(12 * 1024);
+  const validReq = new PassThrough();
+  (async () => {
+    for (let i = 0; i < payload.length; i += 2048) {
+      validReq.write(payload.subarray(i, i + 2048));
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    validReq.end();
+  })();
+
+  const emptyReq = new PassThrough();
+  emptyReq.end();
+
+  const bigReq = new PassThrough();
+  (async () => {
+    bigReq.write(Buffer.alloc(maxBytes)); // at the cap…
+    bigReq.write(Buffer.alloc(1024)); // …then over it: the transform rejects
+    bigReq.end();
+  })();
+
+  const [valid, empty, big] = await Promise.allSettled([
+    store.createFromStream(validReq, { maxBytes, contentType: "video/webm", filename: "ok.webm", accountId: "acc-1" }),
+    store.createFromStream(emptyReq, { maxBytes, contentType: "video/webm", filename: "empty.webm", accountId: "acc-1" }),
+    store.createFromStream(bigReq, { maxBytes, contentType: "video/webm", filename: "big.webm", accountId: "acc-1" })
+  ]);
+
+  // the failures failed for the right reasons
+  assert.equal(empty.status, "rejected");
+  assert.equal(empty.reason.status, 400, "the empty upload is refused as empty");
+  assert.equal(big.status, "rejected");
+  const { UploadTooLarge } = require("../lib/store");
+  assert.ok(big.reason instanceof UploadTooLarge, "the oversized upload is refused as too large");
+
+  // the valid one made it — and intact
+  assert.equal(valid.status, "fulfilled", "the valid upload must survive: " + (valid.reason && valid.reason.stack));
+  const { meta, manageToken } = valid.value;
+  assert.equal(meta.bytes, payload.length);
+  assert.deepEqual(fs.readFileSync(store.videoPath(meta.id)), payload, "the recording on disk is byte-identical");
+  const reMeta = await store.get(meta.id);
+  assert.equal(reMeta.accountId, "acc-1");
+  assert.ok(reMeta.tokenHash, "the manage token hash is recorded");
+  assert.notEqual(reMeta.tokenHash, manageToken, "only the hash is stored");
+
+  // the shared tmp directory is intact and holds no leftover staging files
+  assert.deepEqual(fs.readdirSync(path.join(dir, "tmp")), [], "no staging files were left behind");
+});
+
+test("two concurrent verifies of the same receipt extend the plan once", { timeout: 8000 }, async () => {
+  const acct = await makeAccount("race-payer@example.com");
+  const invoice = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  // a tx hash of this test's own — TX_HASH was already spent on another invoice
+  const raceHash = "0x" + "b7".repeat(32);
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+
+  // Both verifies wait on the (stubbed) network before either commits, so the
+  // serialization point is markPaid, not the HTTP handler: the stub holds
+  // every answer until both requests are in flight.
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  const slowFetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(payments.CHAIN_ID).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    await gate; // both requests are in flight before either returns
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = slowFetch;
+  // launch both, give them time to reach the stubbed chain, then release them
+  const pending = [
+    request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: raceHash }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+    }),
+    request("POST", "/api/billing/verify", {
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: raceHash }),
+      headers: { "content-type": "application/json", authorization: `Bearer ${acct.token}` }
+    })
+  ];
+  await new Promise((r) => setTimeout(r, 100));
+  openGate();
+  globalThis.fetch = realFetch;
+  const [first, second] = await Promise.allSettled(pending);
+
+  // both succeed, but the plan runs 30 days from now, not 60
+  assert.equal(first.status, "fulfilled");
+  assert.equal(second.status, "fulfilled");
+  const a = JSON.parse(first.value.body);
+  const b = JSON.parse(second.value.body);
+  assert.equal(a.status, "paid");
+  assert.equal(b.status, "paid");
+  const onePaidUntil = Math.max(a.paidUntil, b.paidUntil);
+  assert.ok(onePaidUntil < Date.now() + 30 * 24 * 60 * 60 * 1000 + 5000, "one payment, one 30-day extension");
+  assert.ok(onePaidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "and it is a full 30 days");
+  const oneWasIdempotent = a.alreadyPaid === true || b.alreadyPaid === true;
+  assert.ok(oneWasIdempotent, "the second verify reported the plan rather than paying twice");
+
+  // and the invoice ledger holds exactly one paid record for the transaction
+  const raw = fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8");
+  const stored = JSON.parse(raw).invoices.filter((i) => i.txHash === raceHash);
+  assert.equal(stored.length, 1, "the transaction is recorded exactly once");
+  assert.equal(stored[0].status, "paid");
+});
+
+// --- concurrency: finalization and publication ------------------------------
+// These pin review round 2: invoice finalization must re-check replay and
+// expiry inside its mutation lock, and account mutations must publish
+// nothing until their persistence commit has landed.
+
+test("an invoice that expires during verification is never finalized", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-exp-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  // An invoice with 50 ms to live: a verify's preliminary checks run while
+  // it is pending, the (stubbed) chain answers after it has expired, and
+  // finalization — whose checks run inside the mutation lock, at the clock
+  // of that moment — must refuse a dead request.
+  const invoice = await ledger.create("account-1", Date.now() - payments.INVOICE_TTL_MS + 50);
+  await new Promise((r) => setTimeout(r, 80));
+  const txHash = "0x" + "d4".repeat(32);
+  const failed = await ledger.markPaid(invoice.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.ok(failed, "the expired invoice is not paid");
+  assert.equal(failed.status, 410);
+  assert.equal(ledger.find(invoice.id).status, "pending", "the invoice is left as it was");
+  assert.equal(ledger.findByTx(txHash), null, "the transaction is not recorded against it");
+
+  // the refusal holds on disk too
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.find(invoice.id).status, "pending");
+  assert.equal(reopened.findByTx(txHash), null);
+
+  // a live invoice finalizes under the same clock — the letters of the
+  // hash must not matter
+  const live = await ledger.create("account-1");
+  const paid = await ledger.markPaid(live.id, { txHash: txHash.toUpperCase().replace(/^0X/, "0x"), paidAt: Date.now() });
+  assert.equal(paid.already, false);
+  assert.equal(ledger.find(live.id).status, "paid");
+  assert.equal(ledger.find(live.id).txHash, txHash, "the hash is stored normalized");
+
+  // the same transaction again on the paid invoice is idempotent…
+  const sameTx = await ledger.markPaid(live.id, { txHash, paidAt: Date.now() });
+  assert.equal(sameTx.already, true);
+  // …a second invoice cannot take the spent hash…
+  const second = await ledger.create("account-2");
+  const spent = await ledger.markPaid(second.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.ok(spent, "the spent hash is refused on a second invoice");
+  assert.equal(spent.status, 402);
+  // …and neither a malformed hash nor a foreign hash passes the lock
+  const malformed = await ledger.markPaid(second.id, { txHash: "0x1234", paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.equal(malformed.status, 400);
+  assert.equal(ledger.find(second.id).status, "pending");
+});
+
+test("one transaction cannot pay two invoices verified concurrently", { timeout: 8000 }, async () => {
+  const a = await makeAccount("dual-a@example.com");
+  const b = await makeAccount("dual-b@example.com");
+  const invA = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${a.token}` } })).body);
+  const invB = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${b.token}` } })).body);
+
+  // One transaction whose receipt carries a transfer to BOTH invoice
+  // addresses: judged on its own, each verification looks like the exact
+  // payment for its invoice. Both verifies sit on the stubbed chain before
+  // either can finalize, so both pass the route's preliminary replay check
+  // — the race only the lock's own check can settle.
+  const sharedHash = "0x" + "c9".repeat(32);
+  const receipt = {
+    status: "0x1",
+    logs: [
+      transferLog({ contract: payments.USDC_CONTRACT, to: invA.payTo, microUsdc: 10_000_000n }),
+      transferLog({ contract: payments.USDC_CONTRACT, to: invB.payTo, microUsdc: 10_000_000n })
+    ]
+  };
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  const slowFetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(payments.CHAIN_ID).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    await gate;
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = slowFetch;
+  const attempts = [
+    { inv: invA, token: a.token },
+    { inv: invB, token: b.token }
+  ].map(({ inv, token }) => request("POST", "/api/billing/verify", {
+    body: JSON.stringify({ invoiceId: inv.invoiceId, txHash: sharedHash }),
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` }
+  }));
+  await new Promise((r) => setTimeout(r, 100));
+  openGate();
+  globalThis.fetch = realFetch;
+  const settled = await Promise.allSettled(attempts);
+  const statuses = settled.map((s) => s.value.status).sort();
+  assert.deepEqual(statuses, [200, 402], "exactly one verification may finalize");
+
+  const answers = settled.map((s) => JSON.parse(s.value.body));
+  const paidOnes = answers.filter((x) => x.status === "paid");
+  assert.equal(paidOnes.length, 1, "one transaction pays one invoice");
+  assert.ok(paidOnes[0].paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "the winner holds a full 30 days");
+  const refused = answers.find((x) => x.status !== "paid");
+  assert.match(refused.error, /already used/i);
+
+  // the ledger records the transaction exactly once, on the paid invoice
+  const raw = fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8");
+  const withHash = JSON.parse(raw).invoices.filter((i) => i.txHash === sharedHash);
+  assert.equal(withHash.length, 1, "the shared transaction is recorded once");
+  assert.equal(withHash[0].status, "paid");
+
+  // and exactly one of the two accounts holds the plan
+  const plans = [];
+  for (const who of [a, b]) {
+    const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${who.token}` } })).body);
+    plans.push(mine.plan);
+  }
+  assert.deepEqual(plans.sort(), ["free", "paid"]);
+});
+
+test("a plan upgrade is invisible to readers until its commit lands", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-plan-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+  const made = await ledger.create("reader@example.com", "correct horse battery");
+
+  // Hold the plan's commit on the wire, the way a slow or failing disk would.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let holding = true;
+  const realCommit = ledger.commit.bind(ledger);
+  ledger.commit = async (state) => {
+    if (!holding) return realCommit(state);
+    await held;
+    holding = false;
+    throw new Error("disk full");
+  };
+
+  // The upgrade starts and its commit hangs; meanwhile readers authenticate.
+  const upgrade = ledger.setPlan(made.id, payments.extendPaid);
+  await new Promise((r) => setTimeout(r, 20));
+  const whilePending = await ledger.auth(made.token);
+  assert.equal(whilePending.plan, undefined, "no uncommitted plan reaches a reader while the write runs");
+
+  // The write fails: the reader still sees exactly what the disk holds.
+  release();
+  const failed = await upgrade.then(() => null, (err) => err);
+  assert.ok(failed, "the upgrade fails when its commit fails");
+  assert.equal((await ledger.auth(made.token)).plan, undefined, "still free after the failed commit");
+  const raw = fs.readFileSync(path.join(dir, "accounts.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  assert.ok(!raw.includes("paidUntil"), "the uncommitted plan never reached the disk");
+
+  // and a later upgrade commits, becomes visible, and survives a restart
+  ledger.commit = realCommit;
+  const paidUntil = await ledger.setPlan(made.id, payments.extendPaid);
+  assert.ok(paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000);
+  assert.equal((await ledger.auth(made.token)).plan.tier, "paid");
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  assert.equal((await reopened.auth(made.token)).plan.tier, "paid");
+});
+
+// --- recovery: the crash window between the two commits ---------------------
+// A verified payment is two durable commits: the invoice is marked paid,
+// then the account's plan is extended. These pin the round-3 review change:
+// the account snapshot records every invoice it applied next to the
+// paidUntil it bought, and a retry or a restart finishes a grant a crash
+// interrupted — exactly once, with the payment's original timing.
+
+test("a paid invoice stranded by a failed plan commit heals on retry, exactly once", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-heal-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("stranded@example.com", "correct horse battery");
+  const invoice = await notes.create(made.id);
+  // the payment verified five days ago: the invoice committed, the plan did not
+  const paidAt = Date.now() - 5 * 24 * 60 * 60 * 1000;
+  const txHash = "0x" + "e1".repeat(32);
+  await notes.markPaid(invoice.id, { txHash, paidAt });
+
+  // the account commit fails the way a crash or a full disk would
+  const realCommit = ledger.commit.bind(ledger);
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const failed = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) })
+    .then(() => null, (err) => err);
+  assert.ok(failed, "the grant fails with its commit");
+  assert.equal(failed.message, "disk full");
+  ledger.commit = realCommit;
+  assert.equal((await ledger.auth(made.token)).plan, undefined, "no plan after the failed grant");
+
+  // a restart between the two commits: fresh instances read the same files
+  const accounts2 = new Accounts(dir);
+  const invoices2 = new payments.Invoices(dir);
+  await accounts2.init();
+  await invoices2.init();
+  assert.equal(invoices2.find(invoice.id).status, "paid", "the invoice survived as paid");
+  assert.equal((await accounts2.auth(made.token)).plan, undefined, "the plan did not");
+  assert.equal(invoices2.findByTx(txHash).id, invoice.id, "replay protection survives the crash too");
+
+  // recovery grants the entitlement with its original timing — five of the
+  // thirty days have run, they are not restarted
+  const paidUntil = await payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) });
+  assert.ok(Math.abs(paidUntil - (paidAt + payments.MONTH_MS)) < 1000, "the 30 days run from the payment, not from the recovery");
+  assert.ok(paidUntil < Date.now() + 26 * 24 * 60 * 60 * 1000, "recovery does not hand out fresh days");
+
+  // a second recovery — and two concurrent ones — grant nothing extra
+  const [again, racing] = await Promise.all([
+    payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) }),
+    payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) })
+  ]);
+  assert.equal(again, paidUntil);
+  assert.equal(racing, paidUntil);
+  const stored = JSON.parse(fs.readFileSync(path.join(dir, "accounts.json"), "utf8"));
+  const plan = stored.accounts.find((a) => a.id === made.id).plan;
+  assert.equal(plan.paidUntil, paidUntil, "the paidUntil and the applied invoice committed together");
+  assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId), [invoice.id], "the invoice is recorded as applied exactly once");
+
+  // the spent hash still cannot pay a fresh invoice
+  const fresh = await invoices2.create(made.id);
+  const replay = await invoices2.markPaid(fresh.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.equal(replay.status, 402);
+});
+
+test("startup reconciliation heals stranded payments once and skips ambiguous plans", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-reconcile-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+
+  // account A: the classic crash window — a paid invoice and no plan at all
+  const a = await ledger.create("stranded-a@example.com", "correct horse battery");
+  const invoiceA = await notes.create(a.id);
+  const paidAtA = Date.now() - 2 * 24 * 60 * 60 * 1000;
+  await notes.markPaid(invoiceA.id, { txHash: "0x" + "e2".repeat(32), paidAt: paidAtA });
+
+  // account B: a live plan recorded before applications were tracked, and a
+  // paid invoice that may or may not be the reason the plan exists
+  const b = await ledger.create("legacy@example.com", "correct horse battery");
+  await ledger.setPlan(b.id, (copy) => {
+    copy.plan = { tier: "paid", paidUntil: Date.now() + 10 * 24 * 60 * 60 * 1000 };
+    return copy.plan;
+  });
+  const invoiceB = await notes.create(b.id);
+  await notes.markPaid(invoiceB.id, { txHash: "0x" + "e3".repeat(32), paidAt: Date.now() - 1 * 24 * 60 * 60 * 1000 });
+
+  const healed = await payments.reconcileEntitlements({ invoices: notes, accounts: ledger });
+  assert.deepEqual(healed.sort(), [invoiceA.id], "only the provably stranded payment is healed");
+
+  // A holds its plan, timed from its payment, with the invoice recorded
+  const planA = (await ledger.auth(a.token)).plan;
+  assert.equal(planA.tier, "paid");
+  assert.ok(Math.abs(planA.paidUntil - (paidAtA + payments.MONTH_MS)) < 1000);
+  assert.deepEqual(planA.appliedInvoices.map((x) => x.invoiceId), [invoiceA.id]);
+  // B is untouched: granting there could double-count a payment already honored
+  const planB = (await ledger.auth(b.token)).plan;
+  assert.ok(planB.paidUntil > Date.now() + 9 * 24 * 60 * 60 * 1000, "the legacy plan keeps its own timing");
+  assert.equal(planB.appliedInvoices, undefined, "nothing was recorded against the ambiguous plan");
+  assert.equal(notes.find(invoiceB.id).status, "paid", "the ambiguous invoice is not lost — a retry heals it");
+
+  // running again heals nothing — exactly once
+  assert.deepEqual(await payments.reconcileEntitlements({ invoices: notes, accounts: ledger }), []);
+});
+
+// --- round 4: the entitlement adds up in payment order ----------------------
+// The subscription a set of payments buys must not depend on the order the
+// payments were applied or recovered in: an older stranded payment recovered
+// after a later one covers its own window instead of stacking a month onto
+// the later subscription, gaps between subscriptions stay gaps, and
+// reconciliation reads the ledger in payment order.
+
+test("an older stranded payment recovered after a later one covers its own window", async (t) => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  // One scenario, parameterized by which payment is applied first. Both
+  // orders must add up to the same subscription: the day-0 payment covers
+  // days 0–30, the day-60 payment covers days 60–90, the gap stays a gap.
+  async function scenario({ recoverOldFirst }) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-gap-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const ledger = new Accounts(dir);
+    const notes = new payments.Invoices(dir);
+    await ledger.init();
+    await notes.init();
+    const made = await ledger.create("gap@example.com", "correct horse battery");
+
+    // day 0: the payment verifies, the invoice commit lands, the account
+    // commit fails — the payment is stranded and the account has no plan
+    const oldInvoice = await notes.create(made.id);
+    const paidAtOld = Date.now() - 60 * DAY;
+    await notes.markPaid(oldInvoice.id, { txHash: "0x" + "a1".repeat(32), paidAt: paidAtOld });
+    const realCommit = ledger.commit.bind(ledger);
+    ledger.commit = async () => { throw new Error("disk full"); };
+    const failed = await payments
+      .ensureEntitlement({ accounts: ledger, invoice: notes.find(oldInvoice.id) })
+      .then(() => null, (err) => err);
+    assert.ok(failed, "the day-0 grant fails with its commit");
+    ledger.commit = realCommit;
+
+    // day 60: a later payment lands cleanly. Nothing was live when it was
+    // made — the day-0 payment never landed — so it starts a fresh window.
+    const laterInvoice = await notes.create(made.id);
+    const paidAtLater = Date.now();
+    await notes.markPaid(laterInvoice.id, { txHash: "0x" + "a2".repeat(32), paidAt: paidAtLater });
+
+    const oldPaid = notes.find(oldInvoice.id);
+    const laterPaid = notes.find(laterInvoice.id);
+    const first = recoverOldFirst ? oldPaid : laterPaid;
+    const second = recoverOldFirst ? laterPaid : oldPaid;
+    const firstUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: first });
+    const secondUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: second });
+    return { made, dir, oldInvoice, laterInvoice, paidAtOld, paidAtLater, firstUntil, secondUntil };
+  }
+
+  // The later payment applied first starts its own fresh window (days 60–90);
+  // recovering the day-0 payment then covers its own already-spent days 0–30
+  // instead of adding a month on top of the later subscription.
+  const laterFirst = await scenario({ recoverOldFirst: false });
+  assert.ok(Math.abs(laterFirst.firstUntil - (laterFirst.paidAtLater + payments.MONTH_MS)) < 1000,
+    "the later payment starts a fresh window — nothing came before it");
+  assert.equal(laterFirst.secondUntil, laterFirst.firstUntil,
+    "recovering the older payment does not extend the later subscription");
+
+  // The same two payments, recovered in the other order, add up to the same
+  // subscription: the day-0 window runs from the payment (already spent) and
+  // the day-60 payment still owns a fresh 30 days of its own.
+  const oldFirst = await scenario({ recoverOldFirst: true });
+  assert.ok(Math.abs(oldFirst.firstUntil - (oldFirst.paidAtOld + payments.MONTH_MS)) < 1000,
+    "the day-0 window runs from the payment, not the recovery");
+  assert.ok(oldFirst.firstUntil < Date.now(), "and it has already run out — no fresh days");
+  assert.ok(Math.abs(oldFirst.secondUntil - (oldFirst.paidAtLater + payments.MONTH_MS)) < 1000,
+    "the two payments add up to the same subscription either way");
+
+  for (const run of [laterFirst, oldFirst]) {
+    const stored = JSON.parse(fs.readFileSync(path.join(run.dir, "accounts.json"), "utf8"));
+    const plan = stored.accounts.find((a) => a.id === run.made.id).plan;
+    assert.equal(plan.paidUntil, run.secondUntil);
+    assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId).sort(),
+      [run.oldInvoice.id, run.laterInvoice.id].sort());
+    assert.deepEqual(plan.appliedInvoices.map((a) => a.paidAt).sort((a, b) => a - b),
+      [run.paidAtOld, run.paidAtLater], "the ledger records when each payment was made");
+  }
+});
+
+test("reconciliation adds up invoices in payment order, not creation order", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-reconcile-order-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("order@example.com", "correct horse battery");
+
+  // created in one order, paid in the other: the invoice created second was
+  // paid a day earlier, and neither payment ever granted its entitlement
+  const createdFirst = await notes.create(made.id);
+  const createdSecond = await notes.create(made.id);
+  const paidEarlier = Date.now() - 3 * DAY; // created second, paid first
+  const paidLater = Date.now() - 2 * DAY; // created first, paid second
+  await notes.markPaid(createdSecond.id, { txHash: "0x" + "b1".repeat(32), paidAt: paidEarlier });
+  await notes.markPaid(createdFirst.id, { txHash: "0x" + "b2".repeat(32), paidAt: paidLater });
+
+  const healed = await payments.reconcileEntitlements({ invoices: notes, accounts: ledger });
+  assert.deepEqual(healed.sort(), [createdFirst.id, createdSecond.id].sort(), "both stranded payments heal");
+
+  // In payment order: the earlier payment covers its own 30 days and the
+  // later one is made while that coverage is live, so it stacks on top of
+  // what is left. Creation order would stack the other way and land a day off.
+  const plan = (await ledger.auth(made.token)).plan;
+  assert.ok(Math.abs(plan.paidUntil - (paidEarlier + 2 * payments.MONTH_MS)) < 1000,
+    "the subscription adds up in payment order");
+
+  // and a second reconciliation changes nothing — exactly once
+  assert.deepEqual(await payments.reconcileEntitlements({ invoices: notes, accounts: ledger }), []);
+  assert.equal((await ledger.auth(made.token)).plan.paidUntil, plan.paidUntil);
+});
+
+test("a recovered payment whose window ran out grants no live days and keeps the gap", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-expired-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("expired@example.com", "correct horse battery");
+
+  // the payment was made 40 days ago: its 30 days ran out 10 days ago
+  const invoice = await notes.create(made.id);
+  const paidAt = Date.now() - 40 * DAY;
+  await notes.markPaid(invoice.id, { txHash: "0x" + "c1".repeat(32), paidAt });
+  const paidUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) });
+  assert.ok(Math.abs(paidUntil - (paidAt + payments.MONTH_MS)) < 1000, "the window runs from the payment");
+  assert.ok(paidUntil < Date.now(), "it is not restarted from the recovery");
+  const held = await ledger.auth(made.token);
+  assert.equal(payments.activePaidUntil(held), null, "a spent window buys no live plan");
+  assert.equal(payments.limitsFor(held).tier, "free");
+
+  // retries stay exactly once and never shift the expired window
+  assert.equal(await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) }), paidUntil);
+
+  // a fresh payment today starts its own window — the gap stays a gap
+  const fresh = await notes.create(made.id);
+  await notes.markPaid(fresh.id, { txHash: "0x" + "c2".repeat(32), paidAt: Date.now() });
+  const freshUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(fresh.id) });
+  assert.ok(Math.abs(freshUntil - (Date.now() + payments.MONTH_MS)) < 1000,
+    "the fresh window starts now, not on top of the expired one");
+});
+
+test("a plan with a pre-timestamp ledger keeps its entitlement when a new payment lands", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-legacy-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("legacy-ledger@example.com", "correct horse battery");
+
+  // a plan written by the previous revision: a ledger of {invoiceId,
+  // paidUntil} entries with no payment timestamps and no recorded baseline
+  const legacyUntil = Date.now() + 10 * DAY;
+  await ledger.setPlan(made.id, (copy) => {
+    copy.plan = {
+      tier: "paid",
+      paidUntil: legacyUntil,
+      appliedInvoices: [{ invoiceId: "legacy-invoice", paidUntil: legacyUntil }]
+    };
+    return copy.plan;
+  });
+
+  const fresh = await notes.create(made.id);
+  await notes.markPaid(fresh.id, { txHash: "0x" + "d1".repeat(32), paidAt: Date.now() });
+  const until = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(fresh.id) });
+  assert.ok(Math.abs(until - (legacyUntil + payments.MONTH_MS)) < 1000,
+    "the new payment stacks on the legacy plan instead of shortening it");
+  const plan = (await ledger.auth(made.token)).plan;
+  assert.equal(plan.baselineUntil, legacyUntil, "the legacy entitlement is recorded as the explicit baseline");
+  assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId), ["legacy-invoice", fresh.id],
+    "the pre-timestamp entry is kept, so its payment still applies exactly once");
+});
+
+test("a verify whose plan commit fails answers honestly and heals on retry", async (t) => {
+  const acct = await makeAccount("heal-payer@example.com");
+  const invoice = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+  const healHash = "0x" + "f2".repeat(32);
+
+  // fail every account commit that would land a paid plan, the way a crash
+  // between the invoice commit and the account commit would
+  let failPlanCommits = true;
+  const realCommit = Accounts.prototype.commit;
+  Accounts.prototype.commit = async function (state) {
+    if (failPlanCommits && state.accounts.some((a) => a.plan && a.plan.tier === "paid")) {
+      throw new Error("disk full");
+    }
+    return realCommit.call(this, state);
+  };
+  t.after(() => { Accounts.prototype.commit = realCommit; });
+
+  // the verify records the payment but cannot grant the plan: 503, honestly
+  const first = await payInvoice(acct.token, invoice, { receipt, txHash: healHash });
+  assert.equal(first.status, 503);
+  assert.match(JSON.parse(first.body).error, /recorded/i);
+
+  // the payment is durably on disk even though the plan never landed
+  const rawInvoices = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8"));
+  const stranded = rawInvoices.invoices.find((i) => i.id === invoice.invoiceId);
+  assert.equal(stranded.status, "paid");
+  const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  assert.equal(mine.plan, "free");
+
+  // the retry — the same payment verified again — applies the plan once
+  failPlanCommits = false;
+  const second = await payInvoice(acct.token, invoice, { receipt, txHash: healHash });
+  assert.equal(second.status, 200);
+  const healed = JSON.parse(second.body);
+  assert.equal(healed.status, "paid");
+  assert.equal(healed.alreadyPaid, true);
+  assert.ok(healed.paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "one payment, one 30-day window");
+  assert.ok(healed.paidUntil < Date.now() + 30 * 24 * 60 * 60 * 1000 + 5000, "and not a day more");
+  const stored = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "accounts.json"), "utf8"));
+  const mineAfter = stored.accounts.find((a) => a.email === "heal-payer@example.com");
+  assert.equal(mineAfter.plan.appliedInvoices.length, 1, "the retry granted the entitlement exactly once");
+  const [applied] = mineAfter.plan.appliedInvoices;
+  assert.ok(Math.abs(applied.paidAt - Date.now()) < 60_000, "the ledger records when the payment was made");
+
+  // and replay protection held through the crash: the same transaction
+  // cannot pay a new invoice
+  const inv2 = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const replay = await payInvoice(acct.token, inv2, { receipt, txHash: healHash });
+  assert.equal(replay.status, 402);
+  assert.match(JSON.parse(replay.body).error, /already used/i);
+});
 
 after(() => new Promise((resolve) => server.close(() => resolve())));
