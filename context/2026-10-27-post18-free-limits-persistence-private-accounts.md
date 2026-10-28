@@ -244,3 +244,78 @@ reviewed and corrected them.
   to the account that submitted it, its manage key in the owner's cache).
   The browser E2E still cannot run on this lane's machine (no Chrome system
   libraries, no root); it is written to run in CI and on the dev stack.
+
+## Session (2026-10-28): review round 4 — deferred block measurement, universal verification, per-save state, size-vint widths
+
+Round 3 (86b103a) had landed; this session made the four round-4 changes at
+5074fa7. Suite: 84/84 (was 70).
+
+- **webm-duration.js — blocks measured only on a verified Cluster
+  Timestamp.** The old code substituted `cluster.timeTicks ?? 0`, so a block
+  followed by a ten-minute Cluster Timestamp measured near zero and the later
+  Timestamp never corrected it. Blocks are now measured into a per-cluster
+  accumulator (`newClusterAcc()`) in nanoseconds *relative to their own
+  cluster* — order inside the cluster no longer matters — and
+  `resolveCluster()` folds the accumulator onto the segment timeline only
+  when the cluster ends with a Timestamp. A cluster holding blocks that ends
+  with no Timestamp, or carries two Timestamps that disagree, is refused
+  rather than measured from zero (equal repeats are allowed). Boundary gaps
+  between clusters are computed at resolve time (first block of the next vs
+  last block of the previous), then overridden by the last forward jump
+  inside the new cluster — the same gap semantics as before, reproduced
+  across the deferral. Clusters still open at eof (unknown-size, how live
+  recordings end) resolve in `end()`. Also hardened while there: TimestampScale
+  0 is refused (it stops the clock) and two TimestampScale elements that
+  disagree are refused (the timeline would have no single meaning); the first
+  scale — including a non-default one — is still accepted. Tests: blocks
+  before a 600 s Timestamp measure 602 s across chunk sizes 1–4096; missing
+  Timestamp → null; conflicting Timestamps → null; equal repeat → 2 s; zero
+  scale and disagreeing scales → null.
+- **server.js — every upload verified from its file.** The scan used to run
+  only when the client's Content-Type contained webm/matroska; relabeling an
+  MP4 or a webm-as-MP4 slipped past. Now every accepted upload is streamed
+  through the scanner unconditionally: an unverifiable file (an MP4, garbage)
+  is refused 413, an over-cap timeline refused whatever the label. The media
+  format is determined from the stored file itself — `readWebmDocType()`
+  reads the EBML header's DocType from the first 4 KB — and the clip is
+  relabelled: matroska → video/matroska + .mkv, otherwise video/webm +
+  .webm, so the request's Content-Type no longer decides what is stored.
+  The declared-duration prefilter stays as an early rejection (it can only
+  refuse early, never bypass). Tests: over-cap MP4 → 413 /verif/; over-cap
+  webm under a video/mp4 label → 413 /minute/; within-cap webm under
+  video/mp4 stored as video/webm; a matroska DocType stored as
+  video/matroska; blocks-before-over-cap-Timestamp upload → 413, and the
+  same ordering within the cap records the correct 2 s (the old read said 0).
+- **recorder.html — each save is its own operation.** `discardPendingRecording()`
+  used to clear shared globals, so a departed owner's late upload completion
+  erased the successor's pending blob/title/owner, and a stale patch
+  completion assigned `pendingBlob` before its owner check. Now every
+  `saveRecording()` run captures an op object (`saveOp`) plus its own locals;
+  every progress/completion/failure callback checks `stale()` and returns
+  without touching shared state when superseded. The patched blob is stored
+  only if the op still owns the page (the check moved before the assign);
+  `discardPendingRecording(op)` clears only when its op is still current;
+  `againBtn`, `discardBtn`, account teardown and a new recording all
+  invalidate in-flight ops; the write-only `uploadXhr` global is gone.
+  `rememberLocally` still runs for a stale-but-successful upload — the clip
+  exists and the key belongs in its owner's cache regardless of the UI.
+  Browser regression added to e2e/record.mjs (scenario 4e): A's upload held
+  in interception, A signs out, B signs in and records/saves, A's upload is
+  released — B's result screen, list and state stay intact, B records again,
+  the save is stubbed to fail once, B downloads their own pending blob
+  (CDP download dir) and retries to a clean result. Still not runnable on
+  this lane's machine (no Chrome system libs); runs in CI/dev.
+- **lib/webm-patch.js — the Duration patch shared verbatim.** The recorder's
+  inline webmVint/webmChildren/webmSizeVint/patchWebmDuration moved into a
+  UMD module served at /webm-patch.js (CSP 'self' allows it) and required by
+  the tests, so a patch the tests accept is the patch recordings get.
+  `webmSizeVint` was fixed: it always wrote the 0x80 marker, so a two-byte
+  size (e.g. an Info body of 128) declared itself zero-length and corrupted
+  the structure; it now marks 0x80/0x40/0x20… by width, computes with
+  `256 ** k` (no 32-bit shifts), and rejects values outside the ordinary
+  vint range. Tests: exact encodings at 0/126/127/128/16382/16383/16384 and
+  2^21−2, round-trip decode, RangeError bounds; patch fixtures whose Info
+  body lands exactly on 126/127/128/16382/16383/16384 bytes — each patched
+  file's Info size vint has the right width and value and the media timeline
+  still scans to 4 s; the 128 fixture uploads through the API → 201;
+  /webm-patch.js is served and the page loads it with no inline copies left.
