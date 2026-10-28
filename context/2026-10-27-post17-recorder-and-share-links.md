@@ -41,10 +41,11 @@ account-free share links. Zero runtime dependencies — Node stdlib only.
 - **Duration patched client-side before upload** so the stored original is
   already correct for every viewer; the unpatched blob is uploaded if the
   patcher fails (try/catch + 5 s timeout race).
-- **No volume in deploy.json yet.** Clips live in the container filesystem, so
-  a redeploy wipes them. Persistence is explicitly post #18's scope; adding a
-  volume without knowing its mount path was a risk not worth taking blind.
-  Stated openly in the post thread instead.
+- **No volume in deploy.json yet** (superseded 2026-10-28, review round 1
+  asked for durable storage now): `deploy.json` provisions a 5 GB volume
+  mounted at `/data` and sets `DATA_DIR=/data` — the same convention the
+  post-18 and post-19 branches use. The Dockerfile's `/app/data` is only the
+  in-container fallback.
 
 ## Verification
 
@@ -66,7 +67,324 @@ account-free share links. Zero runtime dependencies — Node stdlib only.
 
 ## Known limits, deliberately deferred
 
-- Container redeploys wipe clips (no volume yet) — post #18.
 - No accounts, no published limits, no per-clip listing on the server — post #18.
 - Seeking in unpatched webm (when the patcher fails) is limited; playback still
   works.
+
+## Review round 1 changes (2026-10-28)
+
+- `lib/store.js`: failure cleanup now removes only this upload's staging file
+  (never the shared tmp dir), tears down its streams, and cleans staging up on
+  publication failure too. Oversized bodies are drained up to 1 MB so the 413
+  reaches the client, then the connection is cut. Three concurrent-upload
+  tests (empty/aborted/oversized against a gated in-flight save) and a
+  streaming-oversized test pin this down.
+- `public/recorder.html`: display audio + microphone are mixed into one track
+  via Web Audio (Chrome MediaRecorder cannot take two audio tracks); original
+  streams and the AudioContext are released on success and failure alike, and
+  `recorder.start()` failures are caught. E2E regression check records with
+  both sources and verifies the clip contains audio (decodeAudioData).
+- `public/watch.html`: real `.hidden` CSS; the E2E now asserts rendered
+  visibility (computed style + client rects) for viewers (hidden) and the
+  manage key (shown), not a class name.
+- `deploy.json`: `volume_gb: 5`, `DATA_DIR=/data`; README updated. Verified
+  locally that a clip survives killing the server and booting a fresh one on
+  the same data dir (byte-identical download, original manage key deletes) —
+  the same check on the deployed container happens via the dev preview.
+- Tests: 16 API tests (was 13), all passing, stable across 5 runs. E2E:
+  13 checks (was 10), all passing.
+
+## Running the E2E in this dev container (2026-10-28)
+
+The session container is Debian bookworm with almost no shared libraries, so
+headless Chrome needs hand-setup before `node e2e/record.mjs` will run:
+
+1. `npx puppeteer browsers install chrome` (binary lands in ~/.cache/puppeteer).
+2. `apt-get` cannot install (no root), so download the debs into /tmp and
+   extract them locally: `apt-get -o Dir::State::lists=/tmp/aptlists
+   -o Dir::Cache=/tmp/aptcache update` then `... download <pkgs>` and
+   `dpkg-deb -x <deb> /tmp/chrome-deps/` for each. Needed (incl. transitives):
+   libglib2.0-0 libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0
+   libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
+   libxkbcommon0 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 libx11-6
+   libxcb1 libxext6 libavahi-client3 libavahi-common3 libxau6 libxdmcp6
+   libdrm2 libwayland-server0 libpixman-1-0 libfontconfig1 libfreetype6
+   libpng16-16 libxcb-shm0 libxcb-render0 libxrender1 libfribidi0 libthai0
+   libharfbuzz0b libxi6 libbsd0 libdatrie1 libgraphite2-3 libsqlite3-0,
+   plus `fontconfig-config fonts-dejavu-core` for fonts.
+3. Run with `LD_LIBRARY_PATH=/tmp/chrome-deps/usr/lib/x86_64-linux-gnu:/tmp/chrome-deps/lib/x86_64-linux-gnu`.
+   Missing libsqlite3-0 shows up as a fatal NSS error (nss_error=-5925), not a
+   loader error — that cost real time once.
+4. Fontconfig finds no fonts by default and Chrome *aborts* (SIGABRT in Skia,
+   "SkFontMgr_FontConfigInterface: Not implemented") when it must render text
+   with none. Point it at extracted fonts: write a minimal fonts.conf listing
+   `<dir>`/usr/share/fonts, and run with `FONTCONFIG_PATH` set to it.
+5. CI does not need any of this: build.yml runs only `npm test` (the 13 API
+   tests, no browser). The E2E is a dev-time gate before asking for a push.
+
+## Review round 2 changes (2026-10-28)
+
+- `public/recorder.html` — startup lifecycle races closed:
+  - `startRecording` guards re-entry synchronously (a `starting` flag checked
+    before the first await) and disables the Start button until the attempt
+    succeeds or fails, so repeated clicks during the picker/permission flow
+    cannot start overlapping captures.
+  - Each attempt's capture resources (display, mic, AudioContext, mixed
+    stream) stay in a local `attempt` object until the recording actually
+    starts; every cancelled or failed path releases exactly those via
+    `startupFailed`. Only a started recording is promoted to the shared
+    state.
+  - After the microphone permission resolves, the display video track's
+    `readyState` is verified live — stopping screen sharing while the mic
+    prompt is up aborts the attempt instead of handing an ended track to
+    MediaRecorder.
+  - Finalization runs exactly once per recorder: `onerror` only records
+    `recorderError`; the stop event drives `finalizeRecording()`, which
+    detaches the handlers and nulls `recorder` first. The final
+    dataavailable that follows a recorder error can therefore never be
+    uploaded as a "successful" clip after the failure UI is shown. The
+    failed-synchronous-stop path finalizes inline, guarded by the same
+    `if (!recorder) return`.
+- `e2e/record.mjs` — new checks (21 total, up from 13 at round 0):
+  - repeated Start clicks start exactly one capture flow and the button is
+    disabled while startup is pending (driven by a stubbed getDisplayMedia
+    whose promise the test resolves manually);
+  - display capture ending during the pending microphone permission aborts
+    startup with the failure note, releases the granted microphone track, and
+    re-enables the button;
+  - the error → dataavailable → stop sequence (dispatched by hand via a
+    wrapped MediaRecorder) ends in the failure UI, saves nothing, and leaves
+    the recordings list untouched;
+  - the viewer check now actually plays the clip: `video.play()` is awaited
+    and `currentTime` must advance with no `video.error`.
+
+## Verification status after round 2 (2026-10-28)
+
+- `npm test`: 16/16 pass (including "clips survive a fresh server generation
+  on the same data directory" — the container-replacement persistence check
+  at the server level).
+- `node e2e/record.mjs`: all 21 checks pass, stable across 3 runs.
+- Real screen capture: the main E2E recording used the **real
+  getDisplayMedia path** — headless Chrome honours
+  `--auto-select-desktop-capture-source=Entire screen`, so the capture is
+  genuine Chromium desktop capture of a screen source, encoded by
+  MediaRecorder, uploaded through the product. The microphone is the fake
+  device (this container has no physical mic), and the source is
+  auto-selected by flag rather than picked in the real picker dialog —
+  headless has no picker UI.
+- Still outstanding, by nature of this container (headless Linux, no GUI):
+  a human recording on the dev preview in real desktop Chrome through the
+  picker dialog, with a real screen and microphone. The preview URL for the
+  pushed head arrives with the CI verdict; the plan for the next session on
+  this post is to run this corrected E2E against the dev preview and record
+  the preview URL, playback, download, deletion and deployed-volume
+  persistence results here and in the post thread.
+
+## Merged origin/main into post-17 (2026-10-28)
+
+Main had moved on (post-18's free limits/accounts and post-19's paid plan were
+merged there), built from the same placeholder but evolved separately, so the
+merge was a reconciliation, not a fast-forward. What was taken from where:
+
+- **Taken from main wholesale**: `server.js`, `lib/accounts.js`,
+  `lib/payments.js`, `lib/keccak256.js`, `lib/tar.js`, `lib/webm-duration.js`,
+  `lib/store.js` (main's copy already contains the round-1 upload-cleanup
+  fixes, re-implemented there), `public/limits.html`, `public/upgrade.html`,
+  README, `backend/delivery-stamp.json`, `context/delivery-verify.json`.
+  `package-lock.json`/devDependencies (puppeteer, yauzl) stay from post-17.
+- **Kept from post-17**: `public/watch.html` — main's copy had lost the
+  `.hidden` CSS rule while the page still used the class, which made the
+  delete button visible to every viewer; post-17's round-1 fix is the real
+  rule. The Dockerfile keeps post-17's comment (deploy.json — identical on
+  both branches — mounts the 5 GB volume at /data and sets DATA_DIR=/data;
+  the Dockerfile's /app/data is only the in-container fallback).
+- **Reconciled by hand**:
+  - `public/recorder.html` — main's accounts/usage-meter/free-limit features
+    combined with post-17's reviewed lifecycle work: the synchronous re-entry
+    guard, per-attempt capture cleanup (`startupFailed`/`releaseCapture`),
+    the live-display-track check after the mic permission, Web Audio mixing
+    of display audio + microphone, single finalization via `finalizeRecording`,
+    and the round-3 re-enable of Start on every finalize path. `renderUsage`
+    now respects a pending startup (`starting`) so an account refresh cannot
+    re-enable the button mid-attempt; the free-limit gate keeps the button
+    disabled and relabelled when the meter is full.
+  - `e2e/record.mjs` — one combined flow: sign-up, the round-3 same-page
+    regression (record → save → Record another → second recording saves),
+    the startup-race checks, the exactly-once-finalization check extended
+    with "Start is usable again after a recorder error", the dual-audio clip,
+    main's free-limit/privacy/export/backup-restore checks, and post-17's
+    viewer checks (real playback assertion, byte-identical download,
+    manage-key deletion from a fresh session, rendered delete-button
+    visibility). The backup/restore section now reports skipped-by-design on
+    a remote baseUrl instead of failing the run.
+  - `test/server.test.js` — auto-merged; post-17's three upload tests were
+    ported to the account model (bearer session on every upload, clip-count
+    assertions scoped to this test's own clip, `Store.remove(id, { token })`
+    signature).
+
+## Review round 3 changes (2026-10-28)
+
+- `public/recorder.html`: `finalizeRecording` re-enables Start recording now
+  that the recording is finalized and no startup is pending — on the success,
+  recorder-error and empty-recording paths alike; the cancelled/failed startup
+  paths already re-enabled it via `startupFailed`. Same-page E2E regression:
+  record and save a clip, click "Record another", and successfully start and
+  save a second recording; plus "Start recording is usable again after a
+  recorder error" on the exactly-once error path.
+- Dev-preview verification — see "Dev preview and deployment verification"
+  below.
+
+## Dev preview and deployment verification (2026-10-28)
+
+The dev preview (https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev)
+serves main at e763627 (post-19's merge) — post-17's head is not merged yet,
+so only part of the corrected E2E can pass there today. Run recorded
+2026-10-28 ~12:15 UTC, against the deployed container:
+
+- **Passes on the deployed stack**: sign-up, record and save (real
+  MediaRecorder output, ~155 KB webm), the round-3 same-page regression —
+  "Record another" returns to setup and a second recording starts and saves —
+  and (later in the run) everything up to the second recording.
+- **Fails on the deployed stack, by design of the deployed code**: the
+  startup-race checks (`["display","display"]` — repeated clicks start two
+  capture flows; Start not disabled while startup is pending) and the
+  ended-display-during-mic-permission check. These are exactly the round-2
+  lifecycle bugs this branch fixes; the checks go green on the preview only
+  once post-17 is merged and redeployed. The run then aborts at the race
+  section (the deployed code leaves overlapping captures in flight).
+
+**Deployed-volume persistence, marker planted.** A real 3-second recording
+was made through the product on the deployed container and deliberately left
+there, so the container replacement caused by this session's push becomes the
+redeployment test:
+
+- share: https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev/v/YdSwF0S8mwIWxRbm
+- manage: https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev/v/YdSwF0S8mwIWxRbm?k=PaPLekKbx3Sk7yJGlsGNS8tpDwhRMaM9
+- 59,265 bytes, SHA-256 `7ab8253eb78a5777100e2533279c47689dffa774d84310e043c1ed7c384dc8ba`
+- recorded 2026-10-28T12:21:13Z on the deployed container (serving e763627).
+
+Next session on this post verifies against the replaced container: separate
+viewer playback, byte-identical download (hash above), and deletion with the
+original manage key — then records the outcome here and in the thread.
+
+**Real screen picker**: this environment cannot operate Chrome's picker
+dialog (headless Linux, no GUI; `--auto-select-desktop-capture-source` makes
+headless capture a screen source without the dialog, which is how the E2E's
+recordings are genuine captures). A human recording in desktop Chrome on the
+preview is still the missing acceptance check; asked for in the post thread.
+
+## Dev-preview persistence verification (2026-10-28 ~13:20 UTC)
+
+Follow-up session ran the promised checks against the dev preview
+(https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev) after the
+container replacements from the post-17 push (7a13183) and the post-18 push.
+The marker clip planted at 12:21:13Z was verified end to end:
+
+- **Playback** — real headless Chrome loaded the share page and played the
+  clip: decoded 640x360, duration 3.051 s (matches the stored 3051 ms),
+  currentTime advanced while playing, `video.error` stayed null, no page
+  errors. (Chrome and its libs were rebuilt from the recipe above — the
+  container this session runs in was replaced too.)
+- **Download** — byte-identical: 59,265 bytes, SHA-256
+  `7ab8253eb78a5777100e2533279c47689dffa774d84310e043c1ed7c384dc8ba`,
+  exactly the pre-replacement hash; served with `content-type: video/webm`
+  and `accept-ranges: bytes`.
+- **Deletion** — `DELETE /api/clips/<id>` with the original manage key
+  returned 204 after the replacements; metadata and file then 404
+  (`{"error":"no such clip"}`), so the share page has nothing to play.
+- **Persistence** — the clip was recorded 2026-10-28T12:21:13Z on the then-
+  deployed container and survived the volume across the container
+  replacements caused by two subsequent branch pushes.
+
+The container-replacement persistence, playback, download and deletion
+checks on the dev stack are now all green. What remains outstanding on this
+post is unchanged: the human desktop-Chrome picker recording (requested via
+the attention record), and the operator look the pause asks for before work
+continues. These results were also posted in the post-17 thread.
+
+## Session 2026-10-28 ~18:35 UTC — taken up again, head re-verified
+
+The platform took post #17 up again (the pause is lifted), and this session
+re-verified the branch rather than re-doing work:
+
+- The round-3 changes are in the tree at head 31770fc (a252e36 carries the
+  code change, db64935 the main merge, 7a13183 + 31770fc the context notes).
+  Start recording is re-enabled on every finalization path (recorder.html
+  lines ~377/547/595) and the same-page regressions cover them.
+- 54/54 API tests pass. The full headless-Chrome E2E ran clean twice from a
+  rebuilt Chrome environment (the recipe above had to be redone — the
+  session container was replaced again and /tmp and ~/.cache do not
+  survive): every check passed, including "Record another returns to setup
+  with Start enabled", "a second recording starts and runs", and "Start
+  recording is usable again after a recorder error".
+- The dev preview is serving (HTTP 200). The dev-preview acceptance checks
+  documented above remain as recorded; the human desktop-Chrome picker
+  recording is still the one outstanding acceptance check, re-requested via
+  a fresh attention record (the earlier one did not survive the pause).
+- The booked reminder for the marker-clip verification was closed: its
+  answer was already posted in the thread at 13:22 UTC.
+- Push queued at this head so the platform reviews it (round 4).
+
+## Review round 4 work (2026-10-28 ~19:30 UTC) — merge of moved main, one real product bug, full suites green
+
+Round 4 asked for the corrected E2E to run against a dev preview serving the
+reviewed branch, plus the human desktop-Chrome verification. What this session
+did:
+
+- **Merged the moved main again** (506cd5f, post-18's save-state work:
+  `saveOp`/stale-callback guards, `discardPendingRecording`,
+  per-account recording caches, sign-out clearing, `/webm-patch.js`) into
+  post-17 and reconciled it with the reviewed lifecycle work by hand in
+  `public/recorder.html` and `e2e/record.mjs`; `test/server.test.js` merged
+  with three of the ported upload tests switched to structurally honest webm
+  payloads (main's server verifies the duration from the file itself, so
+  random-byte uploads are refused — the ported tests never ran against that).
+- **A real product bug, found by actually running the E2E**: main's
+  recorder.html declared `const patchWebmDuration = self.OpenLoomWebmPatch.patchWebmDuration;`
+  at top level while `lib/webm-patch.js` declares `async function
+  patchWebmDuration` — two top-level bindings of the same name across classic
+  scripts throw "Identifier has already been declared" and kill the ENTIRE
+  inline script: the studio page is dead on main. Post-18 switched the script
+  src without running a browser E2E (their container has no Chrome). Fixed in
+  the merge; the fix rides into main with it.
+- **Three E2E test bugs from main, all in checks that had never been
+  executed**: (a) the manage-key leak check searched `body.innerHTML`, which
+  matches the page's own inline script text that builds manage hrefs —
+  replaced with an element-scoped check (no anchor points at `?k=`, no input
+  carries one); (b) the switch-during-upload check expected a status message
+  the reviewed stale-callback guard deliberately suppresses — it now asserts
+  the silent drop (result hidden, no links, no leak) and checks the clip's
+  survival through the API and the owner's cache; (c) the stale-completion
+  check clicked Start from a result screen — now goes through
+  "Record another" first.
+- **Chrome 156 download behaviour**: an unscoped `Browser.setDownloadBehavior`
+  applies only to the default browser context; the stale-completion page runs
+  in its own context, so its download of a pending recording went nowhere.
+  The E2E now scopes the policy with `BrowserContext.setDownloadBehavior`.
+- **Timer checks anchored on the test's clock.** Page-clock display windows
+  (`±1s` on the shown timer) failed intermittently under multi-second
+  main-thread stalls in this loaded container — the page's own
+  `performance.now()` age inflated consistently, and an isolated repro of the
+  same code passed cleanly, so it is environment noise, not a product bug.
+  The checks now compare the page-internal recording age against the test's
+  own wall clock (a page cannot run ahead of it): a stale `recordStart` — the
+  round-3 bug these checks guard — still fails by many seconds.
+- **Results at head**: `npm test` 87/87; `node e2e/record.mjs` all 49 checks
+  pass, including the pending-recording download (the fix verified:
+  `recording.webm` lands in the download dir) and the byte-identical viewer
+  download.
+- **The branch-serving preview is not runnable from this side.** The dev
+  preview was fingerprinted by content hash: `/` serves main's recorder.html
+  at e763627 exactly (`uploadXhr` present, `saveOp` absent) — stale main, not
+  this branch, not current main. The deploy pipeline is platform-owned, and
+  the review's own note says the platform team must make the branch available
+  for checks. Asked for in the post thread; the corrected E2E runs against the
+  preview as soon as it serves the branch (the script takes any baseUrl).
+- **Human desktop-Chrome picker verification**: still arranged via the
+  attention record (owner team, due 2026-10-29T18:00Z) — not duplicated. The
+  steps it names are the ones the review asks to be recorded: record through
+  the real screen picker with a microphone, then a separate viewer session
+  plays the clip, downloads it byte-identically, and the author deletes it.
+- The container-replacement persistence results above (marker clip verified
+  for playback, byte-identical download and deletion across two pushes) are
+  retained and still stand.

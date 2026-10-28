@@ -11,7 +11,7 @@
     "node": ">=22"
   },
   "devDependencies": {
-    "puppeteer": "^23.11.1",
+    "puppeteer": "^25.16.0",
     "yauzl": "^3.4.0"
   }
 }
