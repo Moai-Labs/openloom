@@ -104,6 +104,30 @@ async function signUp(page, email) {
   return page.$eval("#whoami", (el) => el.textContent);
 }
 
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
+}
+
+// Records on an already signed-in page and leaves it on the result screen
+// (the caller decides whether to keep the page open or close it).
+async function recordOnPage(page, title, settleMs = 4000) {
+  await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await fill(page, "#title", title);
+  await page.click("#startBtn");
+  try {
+    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  } catch {
+    await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+    await page.click("#startBtn");
+    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  }
+  await new Promise((r) => setTimeout(r, settleMs));
+  await page.click("#stopBtn");
+}
+
 async function main() {
   await startServerIfLocal();
   const browser = await puppeteer.launch({ headless: "shell", args: BROWSER_FLAGS });
@@ -218,6 +242,114 @@ async function main() {
   await switcher.click("#authBtn");
   await switcher.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await switcher.close();
+
+  // 4c. signing out from the saved-result screen must not leave the departing
+  // creator's links behind, nor hand them to whoever signs in next
+  const resultContext = await browser.createBrowserContext();
+  const resultPage = await resultContext.newPage();
+  resultPage.on("pageerror", (err) => console.error("  [pageerror]", err.message));
+  await signUp(resultPage, "resultauthor@example.com");
+  await recordOnPage(resultPage, "Result-screen signout");
+  await resultPage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const manageLinkValue = await resultPage.$eval("#manageLink", (el) => el.value);
+  const manageToken = decodeURIComponent((manageLinkValue.split("?k=")[1] || ""));
+  check("a saved result shows its manage link before sign-out", /^https?:\/\/.+/.test(manageLinkValue), manageLinkValue);
+  await resultPage.click("#signOutLink");
+  await resultPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const clearedResult = await resultPage.evaluate(() => ({
+    resultHidden: document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    manage: document.getElementById("manageLink").value,
+    leak: document.body.innerHTML.includes("?k=")
+  }));
+  check("signing out from the result screen clears its links",
+    clearedResult.resultHidden && clearedResult.share === "" && clearedResult.manage === "" && !clearedResult.leak,
+    JSON.stringify(clearedResult));
+  await fill(resultPage, "#email", "resultnext@example.com");
+  await fill(resultPage, "#password", "correct horse battery");
+  await resultPage.click("#authBtn");
+  await resultPage.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const successorCache = await resultPage.evaluate((tok) => ({
+    own: localStorage.getItem("openloom.recordings:resultnext@example.com"),
+    legacy: localStorage.getItem("openloom.recordings"),
+    leak: document.body.innerHTML.includes("?k="),
+    ownerCacheKept: (localStorage.getItem("openloom.recordings:resultauthor@example.com") || "").includes(tok)
+  }), manageToken);
+  check("the successor's UI and cache carry none of the departing creator's keys",
+    successorCache.own === null && !successorCache.leak &&
+      !(successorCache.legacy || "").includes(manageToken),
+    JSON.stringify({ ...successorCache, ownerCacheKept: "checked-below" }));
+  check("the departing creator's own cache survives for their next session",
+    successorCache.ownerCacheKept);
+  await resultPage.close();
+
+  // 4d. an upload response that lands after an account switch belongs to the
+  // account that submitted it: no links for the successor, the manage key
+  // cached under its owner, the successor's session untouched
+  const switchContext = await browser.createBrowserContext();
+  const switchPage = await switchContext.newPage();
+  switchPage.on("pageerror", (err) => console.error("  [pageerror]", err.message));
+  await switchPage.setRequestInterception(true);
+  let heldUpload = null;
+  let releaseUpload = null;
+  const uploadHeld = new Promise((r) => { releaseUpload = r; });
+  switchPage.on("request", (req) => {
+    if (!heldUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      heldUpload = req; // held: the response will only land after the switch
+      releaseUpload();
+      return;
+    }
+    if (req.method() === "DELETE" && req.url().includes("/api/sessions/current")) {
+      // the sign-out call must not reach the server, so the departing session
+      // stays valid and the held upload can complete for its owner
+      req.respond({ status: 500 });
+      return;
+    }
+    req.continue();
+  });
+  await signUp(switchPage, "switchauthor@example.com");
+  await recordOnPage(switchPage, "Switch-during-upload", 2500);
+  await withTimeout(uploadHeld, 30000, "the upload request was never issued");
+  const switchAuthorToken = await switchPage.evaluate(() => localStorage.getItem("openloom.token"));
+  await switchPage.click("#signOutLink");
+  await switchPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await fill(switchPage, "#email", "switchnext@example.com");
+  await fill(switchPage, "#password", "correct horse battery");
+  await switchPage.click("#authBtn");
+  await switchPage.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden")
+      && /of 3/.test(document.getElementById("usageText").textContent), { timeout: 15000 });
+  await heldUpload.continue();
+  const suppressed = await switchPage.waitForFunction(() =>
+    document.getElementById("setupStatus").textContent.includes("changed accounts")
+  , { timeout: 15000 }).then(() => switchPage.evaluate(() => ({
+    who: document.getElementById("whoami").textContent,
+    resultHidden: document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    manage: document.getElementById("manageLink").value,
+    leak: document.body.innerHTML.includes("?k="),
+    ownCache: localStorage.getItem("openloom.recordings:switchnext@example.com"),
+    nextToken: localStorage.getItem("openloom.token")
+  })), () => null);
+  check("an upload finishing under a switched-in account shows none of the owner's links",
+    !!suppressed && suppressed.who === "switchnext@example.com" && suppressed.resultHidden
+      && suppressed.share === "" && suppressed.manage === "" && !suppressed.leak
+      && suppressed.ownCache === null && suppressed.nextToken !== switchAuthorToken,
+    JSON.stringify(suppressed));
+  const switchClips = await (await fetch(baseUrl + "/api/my/clips", {
+    headers: { Authorization: "Bearer " + switchAuthorToken }
+  })).json();
+  check("the clip from the switched upload is saved to the account that submitted it",
+    (switchClips.clips || []).length === 1, JSON.stringify((switchClips.clips || []).length));
+  const ownerCacheHasIt = await switchPage.evaluate(async (email, token) => {
+    const raw = localStorage.getItem("openloom.recordings:" + email);
+    if (!raw) return false;
+    const clips = (await (await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token } })).json()).clips;
+    const cache = JSON.parse(raw);
+    return clips.length === 1 && cache.some((r) => r.id === clips[0].id && r.token);
+  }, "switchauthor@example.com", switchAuthorToken);
+  check("the manage key from the switched upload lands in its owner's cache", ownerCacheHasIt);
+  await switchPage.close();
 
   // 5. a viewer without any account opens a share link
   const viewerContext = await browser.createBrowserContext();

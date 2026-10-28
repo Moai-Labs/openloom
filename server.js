@@ -631,7 +631,6 @@ server.on("clientError", (err, socket) => {
     loadPage("recorder.html", "text/html; charset=utf-8");
     loadPage("watch.html", "text/html; charset=utf-8");
     loadPage("limits.html", "text/html; charset=utf-8");
-    loadStatic("/vendor/fix-webm-duration.js", "fix-webm-duration.js", "application/javascript; charset=utf-8");
     server.listen(port, () => console.log(`listening on ${server.address().port} — data in ${dataDir}`));
 })().catch((err) => {
     console.error("failed to start:", err);

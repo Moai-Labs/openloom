@@ -192,3 +192,55 @@ round-1 changes re-verified present in the source (accounts mutation queue
 with unique temp files and rollback; per-upload staging teardown; timeline
 scanner ignoring Info.Duration; account-scoped manage-key cache). Push
 re-queued so the merged head gets the review.
+
+## Session (2026-10-28): review round 2 — duration fail-closed + account-switch scoping
+
+The interrupted session had drafted both round-2 changes; this session finished,
+reviewed and corrected them.
+
+- **webm-duration.js — fail closed on an unverifiable timeline.** end() now
+  returns null whenever the complete media timeline cannot be established:
+  the walk stopped on malformed/unsupported input (fail() at every unknown
+  element), the input ended inside an element or a known-size context
+  (eof/truncated, skip>0, declared context end not reached), or an element
+  overruns its parent's boundary. The last frame's length now comes only
+  from what the file asserts, in full: an explicit BlockDuration counts
+  verbatim however long (the old 2 s cap replaced it with 0 — a block at
+  timestamp 0 with a 10-minute BlockDuration reported 0 ms and slipped under
+  the cap), the track's DefaultDuration asserts plain blocks, and laced
+  blocks measure frames × DefaultDuration; a laced block whose track asserts
+  no frame duration is refused rather than measured by guessing. The gap
+  fallback survives only for the latest block, which is what keeps genuine
+  MediaRecorder output (no asserted durations at all) verifiable.
+- **recorder.html — account scoping by captured owner.** The account is
+  captured when the recording starts (pendingOwnerEmail) and the token when
+  the save starts (ownerToken); cache writes go to the captured owner
+  (rememberLocally(data, ownerEmail, ownerTitle)) and upload completions
+  render nothing account-specific when the signed-in owner has changed.
+  Sign-out, account switch and account deletion clear the result links and
+  the departing account's pending recording/preview (clearDepartedAccountState);
+  an in-flight recording's onstop discards quietly (droppingRecording) and a
+  pending save refuses to submit under the successor's session. Stale-session
+  guards (sessionChanged) cover refreshAccount() and overClipLimit(); the
+  vendor fix-webm-duration dependency is replaced by an in-page head-only
+  webm duration patch (no third-party script in the upload path).
+- **Fixes found re-reading the interrupted session's draft:** the stale-upload
+  completion path called clearDepartedAccountState(), which would have torn
+  down the *successor's* active recording (stopped their capture, dumped them
+  to setup) — late callbacks now only discard the stale recording's own
+  fields (discardPendingRecording). A 401 on a stale captured token in
+  renderServerClips() and in the save handler called signOut() unconditionally,
+  signing out whoever is signed in now — both now check the session/token is
+  still the current one.
+- **Tests.** 42/42 API tests (was 33): new unit + 413 tests for a
+  short-start block with an over-cap BlockDuration, over-cap DefaultDuration
+  and laced durations, a laced block with no assertable frame duration,
+  malformed input after a readable timeline, truncated input, and an element
+  overrunning its parent's boundary. Browser tests 4c/4d added to
+  e2e/record.mjs: sign-out from the saved-result screen (links cleared, no
+  ?k= anywhere, successor's UI and cache clean, owner's own cache intact for
+  their next session) and an upload response held until after an account
+  switch (no owner links or keys in the successor's UI/cache, the clip saved
+  to the account that submitted it, its manage key in the owner's cache).
+  The browser E2E still cannot run on this lane's machine (no Chrome system
+  libraries, no root); it is written to run in CI and on the dev stack.

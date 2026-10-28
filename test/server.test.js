@@ -376,6 +376,38 @@ test("a webm whose real timeline exceeds the cap is refused even when the header
   assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
 });
 
+test("a webm whose BlockDuration stretches the timeline past the cap is refused", async () => {
+  const { token } = await makeAccount("webmblockdur@example.com");
+  // every block timestamp sits at zero, but the file itself says the final
+  // block runs ten minutes — the old read discarded that as too long and
+  // stored the clip as a 0 ms one
+  const webm = webmFile({ blockGroups: [{ clusterMs: 0, relMs: 0, blockDuration: 600000 }] });
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
+test("a webm that parses briefly and then turns malformed is refused — no partial duration", async () => {
+  const { token } = await makeAccount("webmtrunc@example.com");
+  // 8 s of readable timeline, then garbage where a further element would be
+  const webm = Buffer.concat([minimalWebm(8000), Buffer.from([0x00, 0x01, 0x02])]);
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /verif/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
 test("a webm with an omitted Duration is still enforced from its timeline", async () => {
   const { token } = await makeAccount("webmnodur@example.com");
   const over = await request("POST", "/api/clips", {
@@ -429,6 +461,64 @@ test("the parser reads real durations from the media timeline", () => {
   assert.equal(readWebmDurationMs(minimalWebm(6500, { declaredMs: 1 })), 6500);
   assert.equal(readWebmDurationMs(Buffer.from("not a webm")), null);
   assert.equal(readWebmDurationMs(Buffer.alloc(0)), null);
+});
+
+test("an asserted BlockDuration counts in full, however long", () => {
+  // a block at timestamp zero whose explicit BlockDuration says ten minutes:
+  // the file's own word, and never to be discarded in favour of a shorter read
+  const webm = webmFile({ blockGroups: [{ clusterMs: 0, relMs: 0, blockDuration: 600000 }] });
+  assert.equal(readWebmDurationMs(webm), 600000);
+});
+
+test("a track DefaultDuration counts in full, however long", () => {
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 600e9 }],
+    spans: [[0, 0]]
+  });
+  assert.equal(readWebmDurationMs(webm), 600000);
+});
+
+test("a laced block is measured through its frame count and the track default", () => {
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 600e9 }],
+    laced: [{ clusterMs: 0, relMs: 0, frames: 2 }]
+  });
+  assert.equal(readWebmDurationMs(webm), 1200000);
+  // within the cap: two 33 ms frames from the default
+  const sane = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 33e6 }],
+    laced: [{ clusterMs: 0, relMs: 0, frames: 2 }]
+  });
+  assert.equal(readWebmDurationMs(sane), 66);
+});
+
+test("a laced block whose track asserts no frame duration is refused", () => {
+  const webm = webmFile({ laced: [{ clusterMs: 0, relMs: 0, frames: 2 }] });
+  assert.equal(readWebmDurationMs(webm), null);
+});
+
+test("malformed input after a readable timeline is refused — no partial duration", () => {
+  const webm = minimalWebm(6500);
+  assert.equal(readWebmDurationMs(Buffer.concat([webm, Buffer.from([0x00, 0x01, 0x02])])), null);
+  assert.equal(readWebmDurationMs(Buffer.concat([webm, Buffer.from([0x53, 0x80])])), null);
+});
+
+test("truncated input after a readable timeline is refused", () => {
+  const webm = minimalWebm(6500);
+  assert.equal(readWebmDurationMs(webm.subarray(0, webm.length - 3)), null);
+  assert.equal(readWebmDurationMs(webm.subarray(0, webm.length - 1)), null);
+});
+
+test("an element that overruns its parent's boundary is refused", () => {
+  const parts = [];
+  parts.push(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
+  parts.push(Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+  parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x83, 0x2a, 0xd7, 0xb1, 0x81, 0x0f, 0x42, 0x40]));
+  // a cluster declaring 10 body bytes whose SimpleBlock claims 20
+  parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x8a]));
+  parts.push(Buffer.from([0xe7, 0x84, 0x00, 0x00, 0x00, 0x00]));
+  parts.push(Buffer.from([0xa3, 0x80 | 20]), Buffer.alloc(20));
+  assert.equal(readWebmDurationMs(Buffer.concat(parts)), null);
 });
 
 test("the streaming scanner matches the buffered read on awkward chunk sizes", () => {
@@ -700,7 +790,7 @@ function spansFor(absMs) {
   return [[32768, absMs - 32768]];
 }
 
-function webmFile({ spans = [], declaredDurationMs = null, padTo = 0 } = {}) {
+function webmFile({ spans = [], declaredDurationMs = null, padTo = 0, tracks = [], blockGroups = [], laced = [] } = {}) {
   const parts = [];
   // EBML header: DocType "webm"
   parts.push(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
@@ -716,6 +806,22 @@ function webmFile({ spans = [], declaredDurationMs = null, padTo = 0 } = {}) {
   }
   const infoBody = Buffer.concat(infoParts);
   parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x80 | infoBody.length]), infoBody);
+  // Tracks: a TrackEntry per {trackNumber, defaultNs}, as a real muxer writes it
+  if (tracks.length) {
+    const entries = tracks.map(({ trackNumber, defaultNs }) => {
+      const durSize = uintBodySize(defaultNs);
+      const durBody = Buffer.alloc(durSize);
+      let v = defaultNs;
+      for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+      const entryBody = Buffer.concat([
+        Buffer.from([0xd7, 0x81, trackNumber]), // TrackNumber, one byte
+        Buffer.from([0x23, 0xe3, 0x83, 0x80 | durBody.length]), durBody // DefaultDuration
+      ]);
+      return Buffer.concat([Buffer.from([0xae, 0x80 | entryBody.length]), entryBody]);
+    });
+    const tracksBody = Buffer.concat(entries);
+    parts.push(Buffer.from([0x16, 0x54, 0xae, 0x6b, 0x80 | tracksBody.length]), tracksBody);
+  }
   for (const [clusterMs, relMs] of spans) {
     parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
     const ts = Buffer.alloc(4);
@@ -728,6 +834,45 @@ function webmFile({ spans = [], declaredDurationMs = null, padTo = 0 } = {}) {
     ]);
     parts.push(Buffer.from([0xa3, 0x80 | blockBody.length]), blockBody);
   }
+  // laced SimpleBlocks: {clusterMs, relMs, frames} — Xiph-style lacing flag,
+  // a frame-count byte, one (zero-length) size byte per extra frame
+  for (const { clusterMs, relMs, frames } of laced) {
+    parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const ts = Buffer.alloc(4);
+    ts.writeUInt32BE(clusterMs, 0);
+    parts.push(Buffer.from([0xe7, 0x84]), ts);
+    const blockBody = Buffer.concat([
+      Buffer.from([0x81]), // track number 1
+      (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+      Buffer.from([0x02]), // lacing: Xiph
+      Buffer.from([frames - 1]), // frame count - 1
+      Buffer.alloc(frames - 1, 0), // Xiph sizes: zero-length first frames
+      Buffer.from([0x00]) // a payload byte for the last frame
+    ]);
+    parts.push(Buffer.from([0xa3, 0x80 | blockBody.length]), blockBody);
+  }
+  // BlockGroups: {clusterMs, relMs, blockDuration} — a Block plus its
+  // explicit BlockDuration, as the spec puts them
+  for (const { clusterMs, relMs, blockDuration } of blockGroups) {
+    parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const ts = Buffer.alloc(4);
+    ts.writeUInt32BE(clusterMs, 0);
+    parts.push(Buffer.from([0xe7, 0x84]), ts);
+    const blockBody = Buffer.concat([
+      Buffer.from([0x81]), // track number 1
+      (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+      Buffer.from([0x00, 0x00]) // flags and a first payload byte
+    ]);
+    const durSize = uintBodySize(blockDuration);
+    const durBody = Buffer.alloc(durSize);
+    let v = blockDuration;
+    for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+    const groupBody = Buffer.concat([
+      Buffer.from([0xa1, 0x80 | blockBody.length]), blockBody,
+      Buffer.from([0x9b, 0x80 | durBody.length]), durBody
+    ]);
+    parts.push(Buffer.from([0xa0, 0x80 | groupBody.length]), groupBody);
+  }
   const base = Buffer.concat(parts);
   const need = padTo - base.length;
   if (need >= 2) {
@@ -738,6 +883,13 @@ function webmFile({ spans = [], declaredDurationMs = null, padTo = 0 } = {}) {
     return Buffer.concat([base, Buffer.from([0xec]), sizeVint(size), Buffer.alloc(size)]);
   }
   return base;
+}
+
+// how many body bytes an unsigned integer needs (1–8, EBML style)
+function uintBodySize(value) {
+  let n = 1;
+  while (value >= Math.pow(2, 8 * n)) n++;
+  return n;
 }
 
 // An EBML size vint: marker bit plus the value in the remaining bits.
