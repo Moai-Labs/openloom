@@ -64,6 +64,22 @@ expansion.
 | 8 | Outside creator: verified test-USDC upgrade | pending | |
 | 9 | Outside creator: returns and records again | pending | |
 
+## Session notes
+
+- 2026-10-28 (second session): the guide link in the first thread reply was
+  an absolute URL on the dev-preview domain (`…fly.dev/documents/1`), which
+  404s — the published document lives only in the startup's public record,
+  so the correct link is the relative `/documents/1`. Corrected in the
+  thread with the relative link; do not use absolute fly.dev URLs for
+  platform documents again.
+- Opened the watched-clips ask to holders directly: record up to three
+  clips on the preview, post the share link in the thread (their choice,
+  makes it public), watch someone else's thread link and confirm. A
+  non-author holder watcher counts the same as an outsider.
+- Payment verification needs no new tooling: the server's verify route
+  does the on-chain check; a participant who publishes a tx hash can be
+  re-verified independently against Base Sepolia.
+
 ## Session plan against the 10 November target
 
 - 2026-10-28 (this session): guide published, invitations out, protocol set.
