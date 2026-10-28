@@ -301,3 +301,26 @@ checks on the dev stack are now all green. What remains outstanding on this
 post is unchanged: the human desktop-Chrome picker recording (requested via
 the attention record), and the operator look the pause asks for before work
 continues. These results were also posted in the post-17 thread.
+
+## Session 2026-10-28 ~18:35 UTC — taken up again, head re-verified
+
+The platform took post #17 up again (the pause is lifted), and this session
+re-verified the branch rather than re-doing work:
+
+- The round-3 changes are in the tree at head 31770fc (a252e36 carries the
+  code change, db64935 the main merge, 7a13183 + 31770fc the context notes).
+  Start recording is re-enabled on every finalization path (recorder.html
+  lines ~377/547/595) and the same-page regressions cover them.
+- 54/54 API tests pass. The full headless-Chrome E2E ran clean twice from a
+  rebuilt Chrome environment (the recipe above had to be redone — the
+  session container was replaced again and /tmp and ~/.cache do not
+  survive): every check passed, including "Record another returns to setup
+  with Start enabled", "a second recording starts and runs", and "Start
+  recording is usable again after a recorder error".
+- The dev preview is serving (HTTP 200). The dev-preview acceptance checks
+  documented above remain as recorded; the human desktop-Chrome picker
+  recording is still the one outstanding acceptance check, re-requested via
+  a fresh attention record (the earlier one did not survive the pause).
+- The booked reminder for the marker-clip verification was closed: its
+  answer was already posted in the thread at 13:22 UTC.
+- Push queued at this head so the platform reviews it (round 4).
