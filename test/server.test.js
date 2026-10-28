@@ -228,4 +228,156 @@ test("the manage token is not stored in plaintext", async () => {
   });
 });
 
+// --- concurrent uploads -----------------------------------------------------
+// A failed upload must clean up only its own staging file. The shared tmp
+// directory and every other upload in flight must survive it untouched.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Waits until cond() is true, so cleanup that races the response can be
+// waited for instead of guessed at.
+async function waitFor(cond, timeoutMs, everyMs = 25) {
+  for (let waited = 0; waited < timeoutMs; waited += everyMs) {
+    if (cond()) return true;
+    await sleep(everyMs);
+  }
+  return false;
+}
+
+// An upload whose body arrives in a first burst and then stops — the server
+// is mid-save and holds a staging file — until finish() sends the rest.
+function gatedUpload(payload) {
+  const req = http.request(base + "/api/clips", {
+    method: "POST",
+    headers: {
+      "content-type": "video/webm",
+      "content-length": String(payload.length)
+    }
+  });
+  const done = new Promise((resolve, reject) => {
+    req.on("response", (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+    });
+    req.on("error", reject);
+  });
+  req.write(payload.subarray(0, 8192));
+  return {
+    req,
+    done,
+    finish: () => req.end(payload.subarray(8192))
+  };
+}
+
+test("empty, aborted and oversized uploads cannot disturb a concurrent save", async () => {
+  const payload = crypto.randomBytes(24 * 1024);
+  const good = gatedUpload(payload);
+  await sleep(100); // its staging file now exists on the server
+
+  // an empty upload alongside
+  const empty = await request("POST", "/api/clips", {
+    body: Buffer.alloc(0),
+    headers: { "content-type": "video/webm" }
+  });
+  assert.equal(empty.status, 400);
+
+  // an aborted upload: bytes first, then the client walks away mid-stream
+  const aborted = await new Promise((resolve) => {
+    const req = http.request(base + "/api/clips", {
+      method: "POST",
+      headers: { "content-type": "video/webm" }
+    });
+    req.on("error", () => resolve("client saw the reset")); // the outcome we asked for
+    req.on("response", () => resolve("got a response"));
+    req.write(crypto.randomBytes(8192));
+    setTimeout(() => req.destroy(), 50);
+  });
+  assert.match(aborted, /reset|response/);
+
+  // an oversized upload alongside
+  const oversized = await request("POST", "/api/clips", {
+    body: crypto.randomBytes(64 * 1024 + 100),
+    headers: { "content-type": "video/webm" }
+  });
+  assert.equal(oversized.status, 413);
+  assert.equal(JSON.parse(oversized.body).error, "recording is too large to store");
+
+  // none of the three failures may have wiped the good upload's staging
+  // file (or each other's leftovers): exactly it remains in tmp
+  assert.ok(await waitFor(() => fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")).length === 1, 3000),
+    "tmp should hold exactly the good upload's staging file");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+
+  // the good upload finishes unharmed, byte for byte
+  good.finish();
+  const saved = await good.done;
+  assert.equal(saved.status, 201);
+  const clip = JSON.parse(saved.body);
+  const file = await request("GET", `/api/clips/${clip.id}/file`);
+  assert.deepEqual(file.body, payload);
+
+  const gone = await request("DELETE", `/api/clips/${clip.id}`, {
+    headers: { authorization: `Bearer ${clip.manageToken}` }
+  });
+  assert.equal(gone.status, 204);
+
+  // nothing leaks afterwards either
+  assert.ok(await waitFor(() => fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")).length === 0, 3000),
+    "tmp should be empty after the uploads settle");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+
+  const healthy = await request("GET", "/healthz");
+  assert.equal(healthy.status, 200);
+});
+
+test("an oversized streaming upload gets its 413 and lets the connection go", async () => {
+  // no content-length: the cap is hit mid-stream, the way a long recording
+  // would actually trip it
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request(base + "/api/clips", { method: "POST", headers: { "content-type": "video/webm" } });
+    req.on("response", (r) => {
+      const chunks = [];
+      r.on("data", (c) => chunks.push(c));
+      r.on("end", () => resolve({ status: r.statusCode, body: Buffer.concat(chunks) }));
+    });
+    req.on("error", reject);
+    // twice the cap in small chunks, then a normal end
+    const chunk = crypto.randomBytes(8 * 1024);
+    let sent = 0;
+    const timer = setInterval(() => {
+      if (sent >= 128 * 1024) {
+        clearInterval(timer);
+        req.end();
+        return;
+      }
+      req.write(chunk);
+      sent += chunk.length;
+    }, 1);
+  });
+  assert.equal(res.status, 413);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")), []);
+});
+
+test("clips survive a fresh server generation on the same data directory", async () => {
+  // the stand-in for a container replacement: a brand-new store opening the
+  // same data dir must serve the same bytes and honour the same manage key
+  const payload = crypto.randomBytes(1024);
+  const create = await request("POST", "/api/clips", {
+    body: payload,
+    headers: { "content-type": "video/webm", "x-title": encodeURIComponent("restart survivor") }
+  });
+  assert.equal(create.status, 201);
+  const clip = JSON.parse(create.body);
+
+  const reborn = new Store(process.env.DATA_DIR);
+  await reborn.init();
+  const meta = await reborn.get(clip.id);
+  assert.ok(meta, "metadata readable after restart");
+  assert.equal(meta.title, "restart survivor");
+  assert.deepEqual(fs.readFileSync(reborn.videoPath(clip.id)), payload);
+  assert.equal(await reborn.remove(clip.id, clip.manageToken), "deleted");
+  assert.equal(await reborn.get(clip.id), null);
+});
+
 after(() => new Promise((resolve) => server.close(() => resolve())));

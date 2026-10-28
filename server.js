@@ -11,6 +11,10 @@ const port = Number(process.env.PORT ?? 3000); // 0 is allowed: tests pick an ep
 const dataDir = process.env.DATA_DIR || path.join(__dirname, "data");
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES) || 200 * 1024 * 1024;
 
+// How much of a rejected upload's body is drained to let the error response
+// through before the connection is simply cut.
+const DRAIN_LIMIT_BYTES = 1024 * 1024;
+
 const store = new Store(dataDir);
 
 // ---------------------------------------------------------------------------
@@ -86,6 +90,20 @@ function parseRange(header, size) {
 // ---------------------------------------------------------------------------
 // Clip API
 
+// Rejects an oversized upload with 413 and deals with the body that is
+// still arriving: it is drained briefly so the error response reaches the
+// client intact, but a body that keeps coming is cut off rather than
+// swallowed.
+function refuseTooLarge(req, res) {
+    sendError(res, 413, "recording is too large to store");
+    let drained = 0;
+    req.on("data", (chunk) => {
+        drained += chunk.length;
+        if (drained > DRAIN_LIMIT_BYTES) req.destroy();
+    });
+    req.resume();
+}
+
 async function createClip(req, res) {
     const contentType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
     if (!contentType.startsWith("video/")) {
@@ -95,7 +113,7 @@ async function createClip(req, res) {
 
     const lengthHeader = Number(req.headers["content-length"]);
     if (Number.isFinite(lengthHeader) && lengthHeader > maxUploadBytes) {
-        sendError(res, 413, "recording is too large to store");
+        refuseTooLarge(req, res);
         return;
     }
 
@@ -103,14 +121,24 @@ async function createClip(req, res) {
     const durationMs = Number(req.headers["x-duration-ms"]);
     const filename = safeFilename(title, contentType);
 
-    const { meta, manageToken } = await store.createFromStream(req, {
-        maxBytes: maxUploadBytes,
-        contentType,
-        filename,
-        title,
-        durationMs: Number.isFinite(durationMs) ? durationMs : null
-    });
+    let saved;
+    try {
+        saved = await store.createFromStream(req, {
+            maxBytes: maxUploadBytes,
+            contentType,
+            filename,
+            title,
+            durationMs: Number.isFinite(durationMs) ? durationMs : null
+        });
+    } catch (err) {
+        if (err instanceof UploadTooLarge) {
+            refuseTooLarge(req, res);
+            return;
+        }
+        throw err;
+    }
 
+    const { meta, manageToken } = saved;
     sendJson(res, 201, {
         id: meta.id,
         title: meta.title,
@@ -249,6 +277,9 @@ async function handle(req, res) {
     const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
     const started = Date.now();
+
+    // A client that walks away mid-request must not turn into a crash.
+    res.on("error", () => {});
 
     res.on("finish", () => {
         console.log(`${req.method} ${u.pathname} ${res.statusCode} ${Date.now() - started}ms`);
