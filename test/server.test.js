@@ -770,6 +770,70 @@ test("the streaming scanner matches the buffered read on awkward chunk sizes", (
   }
 });
 
+// --- round 6: an unknown-size cluster counts even when a sibling ends it ----
+// MediaRecorder writes every Cluster with an unknown size; a live recording
+// is therefore a chain of them, and each one ends only where the next segment
+// sibling begins. The scanner used to pop such a cluster without resolving
+// it, silently discarding everything it held — a long recording front-loaded
+// into an early cluster read as ~0 ms once any later cluster appeared.
+
+test("a later cluster does not erase the earlier clusters' timelines", () => {
+  // the evasion shape from the free-plan review: the long timeline lives in
+  // an unknown-size cluster, and a tiny zero-timestamp cluster behind it made
+  // the scanner drop the first one's blocks and read the file as 0 ms
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0), simpleBlock(32767),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0)
+  ]);
+  // absolute 0 and 32767, then a restart to 0: the fallback adds the last
+  // observed gap (32767 ms) to the highest timestamp — an over-read, which is
+  // the safe direction for a cap
+  assert.equal(readWebmDurationMs(webm), 65534);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), 65534, `chunk size ${size}`);
+  }
+});
+
+test("consecutive unknown-size clusters keep a continuous timeline", () => {
+  // what MediaRecorder actually writes for a long recording: one
+  // unknown-size cluster per flush, each picking up where the last left off
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0), simpleBlock(1000),
+    CLUSTER_UNKNOWN, clusterTimestamp(2000), simpleBlock(0), simpleBlock(1000),
+    CLUSTER_UNKNOWN, clusterTimestamp(4000), simpleBlock(0)
+  ]);
+  // absolute 0, 1000, 2000, 3000, 4000, plus the final observed gap of 1000
+  assert.equal(readWebmDurationMs(webm), 5000);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), 5000, `chunk size ${size}`);
+  }
+});
+
+test("a sibling-terminated cluster still needs its own Timestamp", () => {
+  // ending a cluster at a sibling must not excuse it from the Timestamp
+  // rule: blocks with no base to measure from are refused, not measured
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, simpleBlock(0), simpleBlock(1000),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0)
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+  // and so must the successor: a Timestamp-less cluster after a good one
+  // is refused, not folded in at zero
+  const after = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0),
+    CLUSTER_UNKNOWN, simpleBlock(1000)
+  ]);
+  for (const size of [Infinity, 4096, 7, 1]) {
+    assert.equal(pushedInChunks(after, size), null, `chunk size ${size}`);
+  }
+});
+
 test("the clip-count cap stops the fourth... and every extra clip", async () => {
   const { token } = await makeAccount("countcap@example.com");
   const first = await uploadClip(token, { bytes: 512, durationMs: 1000 });
@@ -1105,6 +1169,84 @@ test("a matroska upload is labelled from its own DocType", async () => {
   assert.equal(meta.contentType, "video/matroska");
   assert.equal(meta.filename, "recording.mkv");
   await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("the multi-cluster evasion shape is measured in full and refused over the cap", async () => {
+  const { token } = await makeAccount("multiclustercap@example.com");
+  // the review's evasion: the long timeline in an unknown-size cluster, a
+  // tiny zero-timestamp cluster behind it — the upload used to read as ~0 ms
+  // and slip past the duration cap
+  const evasive = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0), simpleBlock(32767),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0)
+  ]);
+  const res = await request("POST", "/api/clips", {
+    body: evasive,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+
+  // the same shape within the cap stores with its full parsed duration —
+  // 0 and 1000, then a cluster at 2000, plus the final 1000 ms gap
+  const ok = await request("POST", "/api/clips", {
+    body: Buffer.concat([
+      rawWebmHead(),
+      CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0), simpleBlock(1000),
+      CLUSTER_UNKNOWN, clusterTimestamp(2000), simpleBlock(0)
+    ]),
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(ok.status, 201);
+  const clip = JSON.parse(ok.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 3000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("an upload whose sibling-terminated cluster lacks a Timestamp is refused — nothing is retained", async () => {
+  // the upload-side twin of the scanner regressions above: the same
+  // malformed fixtures, sent the way the recorder sends files, with a
+  // plausible client-written duration to make sure the header never
+  // rescues a file the scanner could not verify
+  const { token } = await makeAccount("tslessupload@example.com");
+  const headers = {
+    "content-type": "video/webm",
+    "x-duration-ms": "3000", // plausible, within the cap, and irrelevant
+    authorization: `Bearer ${token}`
+  };
+  // no Timestamp in the cluster that a sibling ends — the first one
+  const missingBefore = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, simpleBlock(0), simpleBlock(1000),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0)
+  ]);
+  const before = await request("POST", "/api/clips", { body: missingBefore, headers });
+  assert.equal(before.status, 413);
+  assert.match(JSON.parse(before.body).error, /could not be verified|minute/i);
+
+  // and the successor — a Timestamp-less cluster after a good one
+  const missingAfter = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0),
+    CLUSTER_UNKNOWN, simpleBlock(1000)
+  ]);
+  const after = await request("POST", "/api/clips", { body: missingAfter, headers });
+  assert.equal(after.status, 413);
+  assert.match(JSON.parse(after.body).error, /could not be verified|minute/i);
+
+  // neither upload left anything behind: no metadata, no file
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")), []);
+  const me = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${token}` } })).body);
+  assert.equal(me.usage.clips, 0);
+  assert.equal(me.usage.bytes, 0);
 });
 
 // --- round 5: the recorder's Duration patch, exercised verbatim -------------

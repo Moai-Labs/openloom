@@ -4,7 +4,10 @@
 // survive the startup races, hit the free cap with a clear message, export,
 // play and download from a share link as a stranger, delete with the manage
 // key from a fresh session, and a full backup -> wipe -> restore -> playback
-// cycle on the server.
+// cycle on the server. Every account it needs is created under an identity
+// generated for that run alone, and deleted again in a finally block, so a
+// run against a shared dev stack leaves nothing behind — its own or anyone
+// else's.
 //
 // Run with the repo root as cwd:
 //
@@ -98,12 +101,54 @@ async function fill(page, selector, value) {
   }, value);
 }
 
-async function signUp(page, email) {
+import { randomBytes } from "node:crypto";
+
+// Every account the suite touches is created by the run itself, under an
+// identity generated for that run alone: a unique email and a unique random
+// password, recorded in runAccounts the moment it is minted. Cleanup signs
+// each recorded identity back in and deletes only accounts that accept those
+// credentials — accounts that existed before the run (other suites' data,
+// holders' real accounts on a shared dev stack) never match, so they are
+// never touched. Cleanup runs in a finally block, so a run that throws part
+// way through still removes the accounts it did create.
+const runAccounts = [];
+function newIdentity(role) {
+  const id = randomBytes(8).toString("hex");
+  const identity = {
+    email: `${role}-${id}@example.com`,
+    password: randomBytes(24).toString("base64url"),
+  };
+  runAccounts.push(identity);
+  return identity;
+}
+
+async function deleteRunAccounts(label = "cleanup") {
+  for (const { email, password } of runAccounts) {
+    try {
+      const login = await fetch(baseUrl + "/api/sessions", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password })
+      });
+      if (!login.ok) continue; // never created, or already gone: leave it alone
+      const { token } = await login.json();
+      const gone = await fetch(baseUrl + "/api/my/account", {
+        method: "DELETE", headers: { Authorization: "Bearer " + token }
+      });
+      console.log(`INFO  ${label} ${email}: ${gone.status}`);
+    } catch (err) {
+      console.log(`INFO  ${label} ${email} failed: ${err.message}`);
+    }
+  }
+}
+
+async function signUp(page, identity) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   await page.waitForSelector("#auth:not(.hidden)", { timeout: 10000 });
-  await fill(page, "#email", email);
-  await fill(page, "#password", "correct horse battery");
+  await fill(page, "#email", identity.email);
+  await fill(page, "#password", identity.password);
   await page.click("#authBtn");
+  // the identity is minted for this run alone, so signup must work; a sign-in
+  // fallback here would silently adopt an account this run did not create
   await page.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   return page.$eval("#whoami", (el) => el.textContent);
@@ -265,11 +310,43 @@ async function main() {
     if (!ok) failures.push(name);
   };
 
+  try {
+    await runSuite(browser, check, failures);
+  } finally {
+    // a remote run leaves only the accounts it created behind, and only until
+    // this point: delete them even when a check threw. A local run's
+    // throwaway data directory is removed below instead.
+    if (!dataDir) await deleteRunAccounts();
+    await browser.close().catch(() => {});
+    if (child) child.kill();
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  }
+
+  console.log(failures.length ? `\n${failures.length} check(s) failed` : "\nall checks passed");
+  process.exit(failures.length ? 1 : 0);
+}
+
+// one fresh identity per role the scenarios need; all minted before any step
+// runs so cleanup can see them all even when a step throws before its account
+// was ever created
+const IDS = {
+  author: newIdentity("author"),
+  stranger: newIdentity("stranger"),
+  successor: newIdentity("successor"),
+  resultAuthor: newIdentity("resultauthor"),
+  resultNext: newIdentity("resultnext"),
+  switchAuthor: newIdentity("switchauthor"),
+  switchNext: newIdentity("switchnext"),
+  pendingOwner: newIdentity("pendingowner"),
+  afterPending: newIdentity("afterpending"),
+};
+
+async function runSuite(browser, check, failures) {
   // 1. a new creator signs up
   const authorContext = await browser.createBrowserContext();
   const authorPage = await authorContext.newPage();
-  const who = await signUp(authorPage, "author@example.com");
-  check("new creator signs up and is signed in", who === "author@example.com", who);
+  const who = await signUp(authorPage, IDS.author);
+  check("new creator signs up and is signed in", who === IDS.author.email, who);
 
   // 2. same-page lifecycle regression: record and save a clip, select
   // "Record another", and successfully start and save a second recording —
@@ -442,11 +519,11 @@ async function main() {
   // 8. another account sees none of them
   const strangerContext = await browser.createBrowserContext();
   const stranger = await strangerContext.newPage();
-  const strangerEmail = await signUp(stranger, "stranger@example.com");
+  const strangerEmail = await signUp(stranger, IDS.stranger);
   const strangerList = await stranger.waitForFunction(() =>
     /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 })
     .then(() => stranger.$eval("#recList", (ul) => ul.children.length));
-  check("a second account's list is private and empty", strangerEmail === "stranger@example.com" && strangerList === 0,
+  check("a second account's list is private and empty", strangerEmail === IDS.stranger.email && strangerList === 0,
     `${strangerEmail}, ${strangerList} rows`);
 
   // 4b. signing out must hide the departing creator's clips; signing in as
@@ -470,8 +547,8 @@ async function main() {
   })));
   check("signing out empties the clip list and its manage keys",
     signedOutState === true, JSON.stringify(signedOutState));
-  await fill(switcher, "#email", "successor@example.com");
-  await fill(switcher, "#password", "correct horse battery");
+  await fill(switcher, "#email", IDS.successor.email);
+  await fill(switcher, "#password", IDS.successor.password);
   await switcher.click("#authBtn");
   await switcher.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden")
@@ -482,14 +559,14 @@ async function main() {
     leaksKeys: !!document.querySelector('a[href*="?k="]')
   }));
   check("another creator on the same browser sees none of the first creator's clips",
-    successorState.email === "successor@example.com" && successorState.rows === 0 && !successorState.leaksKeys,
+    successorState.email === IDS.successor.email && successorState.rows === 0 && !successorState.leaksKeys,
     JSON.stringify(successorState));
   // hand the shared profile back to the original author for the later steps
   await switcher.click("#signOutLink");
   await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await switcher.click("#signInLink");
-  await fill(switcher, "#email", "author@example.com");
-  await fill(switcher, "#password", "correct horse battery");
+  await fill(switcher, "#email", IDS.author.email);
+  await fill(switcher, "#password", IDS.author.password);
   await switcher.click("#authBtn");
   await switcher.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await switcher.close();
@@ -499,7 +576,7 @@ async function main() {
   const resultContext = await browser.createBrowserContext();
   const resultPage = await resultContext.newPage();
   resultPage.on("pageerror", (err) => console.error("  [pageerror]", err.message));
-  await signUp(resultPage, "resultauthor@example.com");
+  await signUp(resultPage, IDS.resultAuthor);
   await recordOnPage(resultPage, "Result-screen signout");
   await resultPage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
   const manageLinkValue = await resultPage.$eval("#manageLink", (el) => el.value);
@@ -516,15 +593,15 @@ async function main() {
   check("signing out from the result screen clears its links",
     clearedResult.resultHidden && clearedResult.share === "" && clearedResult.manage === "" && !clearedResult.leak,
     JSON.stringify(clearedResult));
-  await fill(resultPage, "#email", "resultnext@example.com");
-  await fill(resultPage, "#password", "correct horse battery");
+  await fill(resultPage, "#email", IDS.resultNext.email);
+  await fill(resultPage, "#password", IDS.resultNext.password);
   await resultPage.click("#authBtn");
   await resultPage.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
-  const successorCache = await resultPage.evaluate((tok) => ({
-    own: localStorage.getItem("openloom.recordings:resultnext@example.com"),
+  const successorCache = await resultPage.evaluate((tok, nextEmail, ownerEmail) => ({
+    own: localStorage.getItem("openloom.recordings:" + nextEmail),
     legacy: localStorage.getItem("openloom.recordings"),
-    ownerCacheKept: (localStorage.getItem("openloom.recordings:resultauthor@example.com") || "").includes(tok)
-  }), manageToken);
+    ownerCacheKept: (localStorage.getItem("openloom.recordings:" + ownerEmail) || "").includes(tok)
+  }), manageToken, IDS.resultNext.email, IDS.resultAuthor.email);
   successorCache.leak = await resultPage.evaluate(PAGE_LEAKS_MANAGE_KEY);
   check("the successor's UI and cache carry none of the departing creator's keys",
     successorCache.own === null && !successorCache.leak &&
@@ -558,14 +635,14 @@ async function main() {
     }
     req.continue();
   });
-  await signUp(switchPage, "switchauthor@example.com");
+  await signUp(switchPage, IDS.switchAuthor);
   await recordOnPage(switchPage, "Switch-during-upload", 2500);
   await withTimeout(uploadHeld, 30000, "the upload request was never issued");
   const switchAuthorToken = await switchPage.evaluate(() => localStorage.getItem("openloom.token"));
   await switchPage.click("#signOutLink");
   await switchPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
-  await fill(switchPage, "#email", "switchnext@example.com");
-  await fill(switchPage, "#password", "correct horse battery");
+  await fill(switchPage, "#email", IDS.switchNext.email);
+  await fill(switchPage, "#password", IDS.switchNext.password);
   await switchPage.click("#authBtn");
   await switchPage.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden")
@@ -577,17 +654,17 @@ async function main() {
   // The clip itself is still saved to the account that submitted it (checked
   // below through the API and the owner's cache).
   await new Promise((r) => setTimeout(r, 1500));
-  const suppressed = await switchPage.evaluate(() => ({
+  const suppressed = await switchPage.evaluate((nextEmail) => ({
     who: document.getElementById("whoami").textContent,
     resultHidden: document.getElementById("result").classList.contains("hidden"),
     share: document.getElementById("shareLink").value,
     manage: document.getElementById("manageLink").value,
-    ownCache: localStorage.getItem("openloom.recordings:switchnext@example.com"),
+    ownCache: localStorage.getItem("openloom.recordings:" + nextEmail),
     nextToken: localStorage.getItem("openloom.token")
-  }));
+  }), IDS.switchNext.email);
   suppressed.leak = await switchPage.evaluate(PAGE_LEAKS_MANAGE_KEY);
   check("an upload finishing under a switched-in account shows none of the owner's links",
-    !!suppressed && suppressed.who === "switchnext@example.com" && suppressed.resultHidden
+    !!suppressed && suppressed.who === IDS.switchNext.email && suppressed.resultHidden
       && suppressed.share === "" && suppressed.manage === "" && !suppressed.leak
       && suppressed.ownCache === null && suppressed.nextToken !== switchAuthorToken,
     JSON.stringify(suppressed));
@@ -602,7 +679,7 @@ async function main() {
     const clips = (await (await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token } })).json()).clips;
     const cache = JSON.parse(raw);
     return clips.length === 1 && cache.some((r) => r.id === clips[0].id && r.token);
-  }, "switchauthor@example.com", switchAuthorToken);
+  }, IDS.switchAuthor.email, switchAuthorToken);
   check("the manage key from the switched upload lands in its owner's cache", ownerCacheHasIt);
   await switchPage.close();
 
@@ -638,7 +715,7 @@ async function main() {
     }
     req.continue();
   });
-  await signUp(stalePage, "pendingowner@example.com");
+  await signUp(stalePage, IDS.pendingOwner);
   const staleOwnerToken = await stalePage.evaluate(() => localStorage.getItem("openloom.token"));
   await recordOnPage(stalePage, "Owner upload pending", 2500);
   await withTimeout(staleUploadHeld, 30000, "the owner's upload request was never issued");
@@ -646,8 +723,8 @@ async function main() {
   // the departure, then the successor on the same page
   await stalePage.click("#signOutLink");
   await stalePage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
-  await fill(stalePage, "#email", "afterpending@example.com");
-  await fill(stalePage, "#password", "correct horse battery");
+  await fill(stalePage, "#email", IDS.afterPending.email);
+  await fill(stalePage, "#password", IDS.afterPending.password);
   await stalePage.click("#authBtn");
   await stalePage.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
@@ -714,6 +791,11 @@ async function main() {
   // and the retry saves it
   await stalePage.click("#retryBtn");
   await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  // the save-success path refreshes the private list in the background —
+  // the result screen is not held hostage to it — so wait for the refreshed
+  // row count rather than reading the list the instant the result shows
+  await stalePage.waitForFunction(() => document.querySelectorAll("#recList li").length === 2,
+    { timeout: 10000 }).catch(() => {});
   const retried = await stalePage.evaluate(() => ({
     share: document.getElementById("shareLink").value,
     rows: document.querySelectorAll("#recList li").length
@@ -822,11 +904,15 @@ async function main() {
     exported?.head?.slice(0, 60));
 
   // 13. persistence: back up, wipe, restore — the clip list and files come back
-  let authorToken = null;
+  // the author's session, captured before any restart touches the page
+  const authorSession = await authorPage.evaluate(() => ({
+    token: localStorage.getItem("openloom.token"),
+    email: localStorage.getItem("openloom.email")
+  }));
+  let originMoved = false;
   if (dataDir) {
     const metaPath = new URL(shares[1]).pathname.replace("/v/", "/api/clips/");
     const before = await (await fetch(baseUrl + metaPath)).json();
-    authorToken = await authorPage.evaluate(() => localStorage.getItem("openloom.token"));
     const backupDir = dataDir + "-backups";
     execFileSync(process.execPath, ["scripts/backup.mjs", "--dir", backupDir], {
       cwd: REPO, env: { ...process.env, DATA_DIR: dataDir }, stdio: "inherit"
@@ -851,6 +937,7 @@ async function main() {
       child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
     });
     baseUrl = restarted;
+    originMoved = true;
     // the pages still sit on the pre-restart origin, so these go through node
     const afterRes = await fetch(restarted + metaPath);
     const after = { status: afterRes.status, body: afterRes.status === 200 ? await afterRes.json() : null };
@@ -858,7 +945,7 @@ async function main() {
       after.status === 200 && after.body.bytes === before.bytes,
       `status ${after.status}`);
     const stillSignedIn = (await fetch(restarted + "/api/me", {
-      headers: { Authorization: "Bearer " + authorToken }
+      headers: { Authorization: "Bearer " + authorSession.token }
     })).status;
     check("accounts survive the restore too", stillSignedIn === 200, `me returned ${stillSignedIn}`);
   } else {
@@ -867,13 +954,17 @@ async function main() {
     console.log("INFO  backup/restore skipped: a remote baseUrl was given");
   }
 
-  // 14. delete everything — on the restarted server, still signed in
-  // (the restart moved ports, so the new origin gets the session back)
-  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
-  await authorPage.evaluate(([t, email]) => {
-    localStorage.setItem("openloom.token", t);
-    localStorage.setItem("openloom.email", email);
-  }, [authorToken, "author@example.com"]);
+  // 14. delete everything — still signed in
+  if (originMoved) {
+    // the restart moved ports, so the new origin gets the session back
+    await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+    await authorPage.evaluate(([t, email]) => {
+      localStorage.setItem("openloom.token", t);
+      localStorage.setItem("openloom.email", email);
+    }, [authorSession.token, authorSession.email]);
+  }
+  // a remote baseUrl keeps its own origin and session; reseeding it here
+  // would clobber the live session with a stale copy
   await authorPage.reload({ waitUntil: "networkidle0" });
   await authorPage.waitForFunction(() => /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 });
   authorPage.on("dialog", (d) => d.accept());
@@ -884,12 +975,10 @@ async function main() {
   const goneAfterPurge = (await fetch(baseUrl + new URL(shares[1]).pathname.replace("/v/", "/api/clips/"))).status;
   check("deleted clips stop playing for viewers", goneAfterPurge === 404, `meta now returns ${goneAfterPurge}`);
 
-  await browser.close();
-  if (child) child.kill();
-  if (dataDir) rmSync(dataDir, { recursive: true, force: true });
-
-  console.log(failures.length ? `\n${failures.length} check(s) failed` : "\nall checks passed");
-  process.exit(failures.length ? 1 : 0);
+  // 15. cleanup is not a step any more: the finally block in main() deletes
+  // exactly the accounts this run created (by signing each recorded identity
+  // back in), on success and on failure alike, and a local run's throwaway
+  // data directory is removed there too.
 }
 
 main().catch((err) => {
