@@ -25,6 +25,13 @@ either.
 - Local re-run after the rewrite: **50 checks, 0 failed** (run A below,
   same revision); API suite still 92/92. The next remote run against the
   dev preview uses these identities and cleans them up in the finally block.
+- 2026-10-28 (this session): the post's attention record for the human
+  real-Chrome check was no longer visible in the post payload, so it was
+  re-filed under the same requestId (`real-chrome-picker-check`) with the
+  same action and due date. No other change was needed: the round-4 review
+  finding is exactly the item this lane cannot produce — the human
+  confirmation — and the Review response in the thread explains why it is
+  not done here rather than claiming it.
 - Verified the failure path directly (2026-10-28 21:15 UTC): the suite ran
   in remote mode against a local server behind a proxy that refuses `/v/`
   share pages, with a pre-existing account (created before the run, under
