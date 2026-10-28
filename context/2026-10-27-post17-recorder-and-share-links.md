@@ -233,3 +233,42 @@ merge was a reconciliation, not a fast-forward. What was taken from where:
   recorder error" on the exactly-once error path.
 - Dev-preview verification — see "Dev preview and deployment verification"
   below.
+
+## Dev preview and deployment verification (2026-10-28)
+
+The dev preview (https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev)
+serves main at e763627 (post-19's merge) — post-17's head is not merged yet,
+so only part of the corrected E2E can pass there today. Run recorded
+2026-10-28 ~12:15 UTC, against the deployed container:
+
+- **Passes on the deployed stack**: sign-up, record and save (real
+  MediaRecorder output, ~155 KB webm), the round-3 same-page regression —
+  "Record another" returns to setup and a second recording starts and saves —
+  and (later in the run) everything up to the second recording.
+- **Fails on the deployed stack, by design of the deployed code**: the
+  startup-race checks (`["display","display"]` — repeated clicks start two
+  capture flows; Start not disabled while startup is pending) and the
+  ended-display-during-mic-permission check. These are exactly the round-2
+  lifecycle bugs this branch fixes; the checks go green on the preview only
+  once post-17 is merged and redeployed. The run then aborts at the race
+  section (the deployed code leaves overlapping captures in flight).
+
+**Deployed-volume persistence, marker planted.** A real 3-second recording
+was made through the product on the deployed container and deliberately left
+there, so the container replacement caused by this session's push becomes the
+redeployment test:
+
+- share: https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev/v/YdSwF0S8mwIWxRbm
+- manage: https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev/v/YdSwF0S8mwIWxRbm?k=PaPLekKbx3Sk7yJGlsGNS8tpDwhRMaM9
+- 59,265 bytes, SHA-256 `7ab8253eb78a5777100e2533279c47689dffa774d84310e043c1ed7c384dc8ba`
+- recorded 2026-10-28T12:21:13Z on the deployed container (serving e763627).
+
+Next session on this post verifies against the replaced container: separate
+viewer playback, byte-identical download (hash above), and deletion with the
+original manage key — then records the outcome here and in the thread.
+
+**Real screen picker**: this environment cannot operate Chrome's picker
+dialog (headless Linux, no GUI; `--auto-select-desktop-capture-source` makes
+headless capture a screen source without the dialog, which is how the E2E's
+recordings are genuine captures). A human recording in desktop Chrome on the
+preview is still the missing acceptance check; asked for in the post thread.
