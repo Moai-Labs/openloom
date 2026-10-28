@@ -1295,6 +1295,185 @@ test("startup reconciliation heals stranded payments once and skips ambiguous pl
   assert.deepEqual(await payments.reconcileEntitlements({ invoices: notes, accounts: ledger }), []);
 });
 
+// --- round 4: the entitlement adds up in payment order ----------------------
+// The subscription a set of payments buys must not depend on the order the
+// payments were applied or recovered in: an older stranded payment recovered
+// after a later one covers its own window instead of stacking a month onto
+// the later subscription, gaps between subscriptions stay gaps, and
+// reconciliation reads the ledger in payment order.
+
+test("an older stranded payment recovered after a later one covers its own window", async (t) => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  // One scenario, parameterized by which payment is applied first. Both
+  // orders must add up to the same subscription: the day-0 payment covers
+  // days 0–30, the day-60 payment covers days 60–90, the gap stays a gap.
+  async function scenario({ recoverOldFirst }) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-gap-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const ledger = new Accounts(dir);
+    const notes = new payments.Invoices(dir);
+    await ledger.init();
+    await notes.init();
+    const made = await ledger.create("gap@example.com", "correct horse battery");
+
+    // day 0: the payment verifies, the invoice commit lands, the account
+    // commit fails — the payment is stranded and the account has no plan
+    const oldInvoice = await notes.create(made.id);
+    const paidAtOld = Date.now() - 60 * DAY;
+    await notes.markPaid(oldInvoice.id, { txHash: "0x" + "a1".repeat(32), paidAt: paidAtOld });
+    const realCommit = ledger.commit.bind(ledger);
+    ledger.commit = async () => { throw new Error("disk full"); };
+    const failed = await payments
+      .ensureEntitlement({ accounts: ledger, invoice: notes.find(oldInvoice.id) })
+      .then(() => null, (err) => err);
+    assert.ok(failed, "the day-0 grant fails with its commit");
+    ledger.commit = realCommit;
+
+    // day 60: a later payment lands cleanly. Nothing was live when it was
+    // made — the day-0 payment never landed — so it starts a fresh window.
+    const laterInvoice = await notes.create(made.id);
+    const paidAtLater = Date.now();
+    await notes.markPaid(laterInvoice.id, { txHash: "0x" + "a2".repeat(32), paidAt: paidAtLater });
+
+    const oldPaid = notes.find(oldInvoice.id);
+    const laterPaid = notes.find(laterInvoice.id);
+    const first = recoverOldFirst ? oldPaid : laterPaid;
+    const second = recoverOldFirst ? laterPaid : oldPaid;
+    const firstUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: first });
+    const secondUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: second });
+    return { made, dir, oldInvoice, laterInvoice, paidAtOld, paidAtLater, firstUntil, secondUntil };
+  }
+
+  // The later payment applied first starts its own fresh window (days 60–90);
+  // recovering the day-0 payment then covers its own already-spent days 0–30
+  // instead of adding a month on top of the later subscription.
+  const laterFirst = await scenario({ recoverOldFirst: false });
+  assert.ok(Math.abs(laterFirst.firstUntil - (laterFirst.paidAtLater + payments.MONTH_MS)) < 1000,
+    "the later payment starts a fresh window — nothing came before it");
+  assert.equal(laterFirst.secondUntil, laterFirst.firstUntil,
+    "recovering the older payment does not extend the later subscription");
+
+  // The same two payments, recovered in the other order, add up to the same
+  // subscription: the day-0 window runs from the payment (already spent) and
+  // the day-60 payment still owns a fresh 30 days of its own.
+  const oldFirst = await scenario({ recoverOldFirst: true });
+  assert.ok(Math.abs(oldFirst.firstUntil - (oldFirst.paidAtOld + payments.MONTH_MS)) < 1000,
+    "the day-0 window runs from the payment, not the recovery");
+  assert.ok(oldFirst.firstUntil < Date.now(), "and it has already run out — no fresh days");
+  assert.ok(Math.abs(oldFirst.secondUntil - (oldFirst.paidAtLater + payments.MONTH_MS)) < 1000,
+    "the two payments add up to the same subscription either way");
+
+  for (const run of [laterFirst, oldFirst]) {
+    const stored = JSON.parse(fs.readFileSync(path.join(run.dir, "accounts.json"), "utf8"));
+    const plan = stored.accounts.find((a) => a.id === run.made.id).plan;
+    assert.equal(plan.paidUntil, run.secondUntil);
+    assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId).sort(),
+      [run.oldInvoice.id, run.laterInvoice.id].sort());
+    assert.deepEqual(plan.appliedInvoices.map((a) => a.paidAt).sort((a, b) => a - b),
+      [run.paidAtOld, run.paidAtLater], "the ledger records when each payment was made");
+  }
+});
+
+test("reconciliation adds up invoices in payment order, not creation order", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-reconcile-order-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("order@example.com", "correct horse battery");
+
+  // created in one order, paid in the other: the invoice created second was
+  // paid a day earlier, and neither payment ever granted its entitlement
+  const createdFirst = await notes.create(made.id);
+  const createdSecond = await notes.create(made.id);
+  const paidEarlier = Date.now() - 3 * DAY; // created second, paid first
+  const paidLater = Date.now() - 2 * DAY; // created first, paid second
+  await notes.markPaid(createdSecond.id, { txHash: "0x" + "b1".repeat(32), paidAt: paidEarlier });
+  await notes.markPaid(createdFirst.id, { txHash: "0x" + "b2".repeat(32), paidAt: paidLater });
+
+  const healed = await payments.reconcileEntitlements({ invoices: notes, accounts: ledger });
+  assert.deepEqual(healed.sort(), [createdFirst.id, createdSecond.id].sort(), "both stranded payments heal");
+
+  // In payment order: the earlier payment covers its own 30 days and the
+  // later one is made while that coverage is live, so it stacks on top of
+  // what is left. Creation order would stack the other way and land a day off.
+  const plan = (await ledger.auth(made.token)).plan;
+  assert.ok(Math.abs(plan.paidUntil - (paidEarlier + 2 * payments.MONTH_MS)) < 1000,
+    "the subscription adds up in payment order");
+
+  // and a second reconciliation changes nothing — exactly once
+  assert.deepEqual(await payments.reconcileEntitlements({ invoices: notes, accounts: ledger }), []);
+  assert.equal((await ledger.auth(made.token)).plan.paidUntil, plan.paidUntil);
+});
+
+test("a recovered payment whose window ran out grants no live days and keeps the gap", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-expired-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("expired@example.com", "correct horse battery");
+
+  // the payment was made 40 days ago: its 30 days ran out 10 days ago
+  const invoice = await notes.create(made.id);
+  const paidAt = Date.now() - 40 * DAY;
+  await notes.markPaid(invoice.id, { txHash: "0x" + "c1".repeat(32), paidAt });
+  const paidUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) });
+  assert.ok(Math.abs(paidUntil - (paidAt + payments.MONTH_MS)) < 1000, "the window runs from the payment");
+  assert.ok(paidUntil < Date.now(), "it is not restarted from the recovery");
+  const held = await ledger.auth(made.token);
+  assert.equal(payments.activePaidUntil(held), null, "a spent window buys no live plan");
+  assert.equal(payments.limitsFor(held).tier, "free");
+
+  // retries stay exactly once and never shift the expired window
+  assert.equal(await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) }), paidUntil);
+
+  // a fresh payment today starts its own window — the gap stays a gap
+  const fresh = await notes.create(made.id);
+  await notes.markPaid(fresh.id, { txHash: "0x" + "c2".repeat(32), paidAt: Date.now() });
+  const freshUntil = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(fresh.id) });
+  assert.ok(Math.abs(freshUntil - (Date.now() + payments.MONTH_MS)) < 1000,
+    "the fresh window starts now, not on top of the expired one");
+});
+
+test("a plan with a pre-timestamp ledger keeps its entitlement when a new payment lands", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-legacy-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const DAY = 24 * 60 * 60 * 1000;
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("legacy-ledger@example.com", "correct horse battery");
+
+  // a plan written by the previous revision: a ledger of {invoiceId,
+  // paidUntil} entries with no payment timestamps and no recorded baseline
+  const legacyUntil = Date.now() + 10 * DAY;
+  await ledger.setPlan(made.id, (copy) => {
+    copy.plan = {
+      tier: "paid",
+      paidUntil: legacyUntil,
+      appliedInvoices: [{ invoiceId: "legacy-invoice", paidUntil: legacyUntil }]
+    };
+    return copy.plan;
+  });
+
+  const fresh = await notes.create(made.id);
+  await notes.markPaid(fresh.id, { txHash: "0x" + "d1".repeat(32), paidAt: Date.now() });
+  const until = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(fresh.id) });
+  assert.ok(Math.abs(until - (legacyUntil + payments.MONTH_MS)) < 1000,
+    "the new payment stacks on the legacy plan instead of shortening it");
+  const plan = (await ledger.auth(made.token)).plan;
+  assert.equal(plan.baselineUntil, legacyUntil, "the legacy entitlement is recorded as the explicit baseline");
+  assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId), ["legacy-invoice", fresh.id],
+    "the pre-timestamp entry is kept, so its payment still applies exactly once");
+});
+
 test("a verify whose plan commit fails answers honestly and heals on retry", async (t) => {
   const acct = await makeAccount("heal-payer@example.com");
   const invoice = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
@@ -1337,7 +1516,8 @@ test("a verify whose plan commit fails answers honestly and heals on retry", asy
   const stored = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "accounts.json"), "utf8"));
   const mineAfter = stored.accounts.find((a) => a.email === "heal-payer@example.com");
   assert.equal(mineAfter.plan.appliedInvoices.length, 1, "the retry granted the entitlement exactly once");
-  assert.deepEqual(mineAfter.plan.appliedInvoices.map((a) => a.paidUntil), [healed.paidUntil]);
+  const [applied] = mineAfter.plan.appliedInvoices;
+  assert.ok(Math.abs(applied.paidAt - Date.now()) < 60_000, "the ledger records when the payment was made");
 
   // and replay protection held through the crash: the same transaction
   // cannot pay a new invoice

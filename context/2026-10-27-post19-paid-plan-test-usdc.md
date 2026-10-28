@@ -192,3 +192,51 @@ nothing. The window is now recoverable, exactly once:
   commit, fresh instances, original-timing assertion, concurrent retries,
   replay protection retained), startup reconciliation with the
   legacy-plan skip, and the API-level 503 → retry → healed-once flow.
+
+## Round 4 (2026-10-28) — the entitlement adds up in payment order
+
+The round-4 review caught a real order-dependence in recovery:
+`applyInvoiceEntitlement` judged an older payment against the plan's
+*current* `paidUntil`, treating entitlement that a *later* payment had
+bought as if it existed when the older payment was made. A day-0 payment
+whose account commit failed, followed by a day-60 payment (fresh window,
+day 60–90), extended the plan to day 120 when the day-0 invoice was
+recovered — a free month. Reconciliation was also order-dependent, walking
+invoices in creation order rather than payment order.
+
+- **The ledger now records payment timestamps.** `plan.appliedInvoices`
+  entries are `{invoiceId, paidAt}` — when the payment was made, not just
+  the paidUntil it bought. The subscription is *recomputed* from the whole
+  ledger on every application instead of extended from the plan's current
+  state.
+- **`paidUntilFromPayments({ baselineUntil, payments })`** is that
+  recomputation: payments sorted by `paidAt`; a payment made while coverage
+  is live stacks 30 days on top of what is left, one made after it ran out
+  starts a fresh window, and a gap between subscriptions stays a gap. The
+  result is a pure function of the baseline and the payment set, so it
+  cannot depend on application or recovery order — recovering the day-0
+  payment after the day-60 one covers days 0–30 and leaves the later
+  subscription untouched. Adding a payment can only raise or keep the
+  computed end, so a recompute never shortens a live plan.
+- **`baselineUntilFor`** records the explicit baseline the review asked
+  for: the first tracked application on a ledger-less plan stores that
+  plan's `paidUntil` as `plan.baselineUntil` (entitlement that predates the
+  ledger), and later recomputations reuse it verbatim instead of
+  re-deriving it from the current plan. A ledger written by the previous
+  revision (entries with `paidUntil` but no `paidAt`, no baseline field)
+  keeps what its entries bought as the baseline — without timestamps it
+  cannot be recomputed, so it is never shortened — and only timestamped
+  payments join the math.
+- **`reconcileEntitlements` processes paid invoices in payment order**
+  (sorted by `paidAt`), not creation order. With recomputation the final
+  state is order-independent regardless; the sort makes the intermediate
+  states deterministic too.
+- **Retries unchanged**: an invoice already in the ledger returns the plan
+  untouched, so a retry can never restart or shift an expired payment's
+  30-day window; an expired window buys no live plan and a later payment
+  starts its own window across the gap.
+- Suite grew 47 → 51: the stranded-day-0-recovered-after-day-60 regression
+  in both recovery orders (same subscription either way), reconciliation of
+  invoices created and paid in opposite orders, an expired payment's
+  window recovered without restart or shift, and a pre-timestamp ledger
+  keeping its entitlement when a new payment lands.
