@@ -152,3 +152,43 @@ Two changes, one commit:
   concurrent replay race over HTTP, and the blocked-then-failed plan
   commit with concurrent auth readers. Verified stable across repeated
   runs.
+
+## Round 3 (2026-10-28) — the crash window is closed, not documented
+
+The round-3 review was right to reject the round-2 position recorded above
+("a crash between the invoice commit and the plan commit remains a known
+window"). A verified payment is two durable commits — invoice marked paid,
+account plan extended — and a crash between them consumed the payment
+without granting anything; a re-verify answered `already: true` and repaired
+nothing. The window is now recoverable, exactly once:
+
+- **The account snapshot carries the proof.** `plan.appliedInvoices` holds
+  one `{invoiceId, paidUntil}` entry per payment the plan has honored,
+  committed in the same snapshot as the `paidUntil` it bought. "Was this
+  payment honored?" now has one durable answer.
+- **`applyInvoiceEntitlement`** is the planOf used for payments. It runs
+  inside the account lock, is idempotent (a plan already carrying the
+  invoice is returned unchanged, so concurrent retries cannot stack months),
+  and anchors the 30 days at the invoice's own `paidAt` — a recovery days
+  later neither restarts the window nor shortens a later extension (final
+  paidUntil is the max of the paidAt-anchored value and the live plan).
+- **`ensureEntitlement({accounts, invoice})`** is the single grant
+  operation: a fresh verify, a retry of an already-paid invoice, and
+  reconciliation all go through it. If the account commit fails, the
+  invoice is still durably paid; the route answers 503 honestly and the
+  next verify — or the next boot — finishes the grant.
+- **`reconcileEntitlements`** runs once at boot (after `invoices.init()`,
+  which the server previously never called — a restart silently forgot
+  pending invoices; fixed here too). It skips accounts whose plan predates
+  application tracking (no `appliedInvoices` array): for those invoices it
+  cannot be proven whether the payment was honored, and the safe side of
+  that doubt is granting nothing extra. A holder retrying the payment
+  itself still heals, since there the holder asked.
+- **Route semantics**: the finalize path uses `ensureEntitlement` instead of
+  raw `setPlan(extendPaid)`; `extendPaid` remains for compatibility and is
+  still unit-tested. The early already-paid path now also ensures the
+  entitlement before answering.
+- Suite grew 44 → 47: stranded-invoice recovery across a restart (failed
+  commit, fresh instances, original-timing assertion, concurrent retries,
+  replay protection retained), startup reconciliation with the
+  legacy-plan skip, and the API-level 503 → retry → healed-once flow.

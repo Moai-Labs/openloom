@@ -453,8 +453,17 @@ async function verifyInvoicePayment(req, res, account) {
         return;
     }
     if (invoice.status === "paid") {
-        // Idempotent: verifying the same invoice twice answers with the plan, not an error.
-        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: livePaidUntil(account.id), alreadyPaid: true });
+        // Idempotent: verifying the same invoice twice answers with the plan,
+        // not an error. A retry is also where a payment whose plan never
+        // landed is healed — applying the entitlement is exactly once, so a
+        // retry grants nothing the payment has not already bought.
+        try {
+            await payments.ensureEntitlement({ accounts, invoice });
+        } catch {
+            sendError(res, 503, "your payment is recorded — the plan could not be applied just now; try again in a moment");
+            return;
+        }
+        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: livePaidUntil(account.id), alreadyPaid: true, test: true });
         return;
     }
     if (invoice.status === "expired") {
@@ -493,17 +502,21 @@ async function verifyInvoicePayment(req, res, account) {
     // everything inside the lock — a concurrent verify of the same receipt
     // answers already-paid here so the plan is not extended twice, a hash
     // another invoice already took is refused, and an invoice that expired
-    // while the verification was on the wire is not paid. The invoice and
-    // the account each publish only once their own commit has landed, so a
-    // competing write or a crash cannot leave a half-applied state in
-    // memory; if a crash ever separated the two commits on disk, the
-    // idempotent path below heals the missing plan.
-    const { already } = await invoices.markPaid(invoice.id, { txHash: txHash.toLowerCase(), paidAt: Date.now() });
-    // A payment this request finalized extends the plan — markPaid answers
-    // already=false to exactly one request per invoice, so the plan is
-    // extended exactly once; the request that lost the race reports the
-    // plan as the committed state holds it.
-    const paidUntil = already ? livePaidUntil(account.id) : await accounts.setPlan(account.id, payments.extendPaid);
+    // while the verification was on the wire is not paid.
+    const { already, invoice: paid } = await invoices.markPaid(invoice.id, { txHash: txHash.toLowerCase(), paidAt: Date.now() });
+    // The entitlement applies through the same idempotent operation a retry
+    // and startup reconciliation use, so the two commits can no longer
+    // strand a payment: the account snapshot records the invoice next to
+    // the paidUntil it bought, and if this commit fails the invoice is
+    // still durably paid — the next verify of it, or the next boot, grants
+    // the 30 days with their original timing, exactly once.
+    let paidUntil;
+    try {
+        paidUntil = await payments.ensureEntitlement({ accounts, invoice: paid });
+    } catch {
+        sendError(res, 503, "your payment is verified and recorded, but the plan could not be applied just now — verify the same payment again in a moment and it will apply");
+        return;
+    }
     const reply = { status: "paid", tier: "paid", paidUntil, test: true };
     if (already) reply.alreadyPaid = true;
     sendJson(res, 200, reply);
@@ -807,6 +820,16 @@ server.on("clientError", (err, socket) => {
 (async () => {
     await store.init();
     await accounts.init();
+    // Payment requests are persisted so a restart does not strand one —
+    // load them before anything reads the ledger.
+    await invoices.init();
+    // Finish any grant a crash interrupted: an invoice committed as paid
+    // but whose plan never landed. Idempotent — it grants nothing twice,
+    // and it restores the payment's original 30-day window.
+    const healed = await payments.reconcileEntitlements({ invoices, accounts });
+    if (healed.length > 0) {
+        console.log(`recovered ${healed.length} paid payment(s) whose plan had not been applied`);
+    }
     loadPage("recorder.html", "text/html; charset=utf-8");
     loadPage("watch.html", "text/html; charset=utf-8");
     loadPage("limits.html", "text/html; charset=utf-8");

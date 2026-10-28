@@ -671,12 +671,12 @@ test("invoices: one transaction pays one invoice, stale ones expire", async (t) 
 
 const TX_HASH = "0x" + "a7".repeat(32);
 
-async function payInvoice(token, invoice, { receipt, chainId } = {}) {
+async function payInvoice(token, invoice, { receipt, chainId, txHash = TX_HASH } = {}) {
   const realFetch = globalThis.fetch;
   globalThis.fetch = stubFetch({ receipt, chainId });
   try {
     return await request("POST", "/api/billing/verify", {
-      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash: TX_HASH }),
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash }),
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` }
     });
   } finally {
@@ -1187,6 +1187,164 @@ test("a plan upgrade is invisible to readers until its commit lands", async (t) 
   const reopened = new Accounts(dir);
   await reopened.init();
   assert.equal((await reopened.auth(made.token)).plan.tier, "paid");
+});
+
+// --- recovery: the crash window between the two commits ---------------------
+// A verified payment is two durable commits: the invoice is marked paid,
+// then the account's plan is extended. These pin the round-3 review change:
+// the account snapshot records every invoice it applied next to the
+// paidUntil it bought, and a retry or a restart finishes a grant a crash
+// interrupted — exactly once, with the payment's original timing.
+
+test("a paid invoice stranded by a failed plan commit heals on retry, exactly once", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-heal-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+  const made = await ledger.create("stranded@example.com", "correct horse battery");
+  const invoice = await notes.create(made.id);
+  // the payment verified five days ago: the invoice committed, the plan did not
+  const paidAt = Date.now() - 5 * 24 * 60 * 60 * 1000;
+  const txHash = "0x" + "e1".repeat(32);
+  await notes.markPaid(invoice.id, { txHash, paidAt });
+
+  // the account commit fails the way a crash or a full disk would
+  const realCommit = ledger.commit.bind(ledger);
+  ledger.commit = async () => { throw new Error("disk full"); };
+  const failed = await payments.ensureEntitlement({ accounts: ledger, invoice: notes.find(invoice.id) })
+    .then(() => null, (err) => err);
+  assert.ok(failed, "the grant fails with its commit");
+  assert.equal(failed.message, "disk full");
+  ledger.commit = realCommit;
+  assert.equal((await ledger.auth(made.token)).plan, undefined, "no plan after the failed grant");
+
+  // a restart between the two commits: fresh instances read the same files
+  const accounts2 = new Accounts(dir);
+  const invoices2 = new payments.Invoices(dir);
+  await accounts2.init();
+  await invoices2.init();
+  assert.equal(invoices2.find(invoice.id).status, "paid", "the invoice survived as paid");
+  assert.equal((await accounts2.auth(made.token)).plan, undefined, "the plan did not");
+  assert.equal(invoices2.findByTx(txHash).id, invoice.id, "replay protection survives the crash too");
+
+  // recovery grants the entitlement with its original timing — five of the
+  // thirty days have run, they are not restarted
+  const paidUntil = await payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) });
+  assert.ok(Math.abs(paidUntil - (paidAt + payments.MONTH_MS)) < 1000, "the 30 days run from the payment, not from the recovery");
+  assert.ok(paidUntil < Date.now() + 26 * 24 * 60 * 60 * 1000, "recovery does not hand out fresh days");
+
+  // a second recovery — and two concurrent ones — grant nothing extra
+  const [again, racing] = await Promise.all([
+    payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) }),
+    payments.ensureEntitlement({ accounts: accounts2, invoice: invoices2.find(invoice.id) })
+  ]);
+  assert.equal(again, paidUntil);
+  assert.equal(racing, paidUntil);
+  const stored = JSON.parse(fs.readFileSync(path.join(dir, "accounts.json"), "utf8"));
+  const plan = stored.accounts.find((a) => a.id === made.id).plan;
+  assert.equal(plan.paidUntil, paidUntil, "the paidUntil and the applied invoice committed together");
+  assert.deepEqual(plan.appliedInvoices.map((a) => a.invoiceId), [invoice.id], "the invoice is recorded as applied exactly once");
+
+  // the spent hash still cannot pay a fresh invoice
+  const fresh = await invoices2.create(made.id);
+  const replay = await invoices2.markPaid(fresh.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.equal(replay.status, 402);
+});
+
+test("startup reconciliation heals stranded payments once and skips ambiguous plans", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-reconcile-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  const notes = new payments.Invoices(dir);
+  await ledger.init();
+  await notes.init();
+
+  // account A: the classic crash window — a paid invoice and no plan at all
+  const a = await ledger.create("stranded-a@example.com", "correct horse battery");
+  const invoiceA = await notes.create(a.id);
+  const paidAtA = Date.now() - 2 * 24 * 60 * 60 * 1000;
+  await notes.markPaid(invoiceA.id, { txHash: "0x" + "e2".repeat(32), paidAt: paidAtA });
+
+  // account B: a live plan recorded before applications were tracked, and a
+  // paid invoice that may or may not be the reason the plan exists
+  const b = await ledger.create("legacy@example.com", "correct horse battery");
+  await ledger.setPlan(b.id, (copy) => {
+    copy.plan = { tier: "paid", paidUntil: Date.now() + 10 * 24 * 60 * 60 * 1000 };
+    return copy.plan;
+  });
+  const invoiceB = await notes.create(b.id);
+  await notes.markPaid(invoiceB.id, { txHash: "0x" + "e3".repeat(32), paidAt: Date.now() - 1 * 24 * 60 * 60 * 1000 });
+
+  const healed = await payments.reconcileEntitlements({ invoices: notes, accounts: ledger });
+  assert.deepEqual(healed.sort(), [invoiceA.id], "only the provably stranded payment is healed");
+
+  // A holds its plan, timed from its payment, with the invoice recorded
+  const planA = (await ledger.auth(a.token)).plan;
+  assert.equal(planA.tier, "paid");
+  assert.ok(Math.abs(planA.paidUntil - (paidAtA + payments.MONTH_MS)) < 1000);
+  assert.deepEqual(planA.appliedInvoices.map((x) => x.invoiceId), [invoiceA.id]);
+  // B is untouched: granting there could double-count a payment already honored
+  const planB = (await ledger.auth(b.token)).plan;
+  assert.ok(planB.paidUntil > Date.now() + 9 * 24 * 60 * 60 * 1000, "the legacy plan keeps its own timing");
+  assert.equal(planB.appliedInvoices, undefined, "nothing was recorded against the ambiguous plan");
+  assert.equal(notes.find(invoiceB.id).status, "paid", "the ambiguous invoice is not lost — a retry heals it");
+
+  // running again heals nothing — exactly once
+  assert.deepEqual(await payments.reconcileEntitlements({ invoices: notes, accounts: ledger }), []);
+});
+
+test("a verify whose plan commit fails answers honestly and heals on retry", async (t) => {
+  const acct = await makeAccount("heal-payer@example.com");
+  const invoice = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const receipt = { status: "0x1", logs: [transferLog({ contract: payments.USDC_CONTRACT, to: invoice.payTo, microUsdc: 10_000_000n })] };
+  const healHash = "0x" + "f2".repeat(32);
+
+  // fail every account commit that would land a paid plan, the way a crash
+  // between the invoice commit and the account commit would
+  let failPlanCommits = true;
+  const realCommit = Accounts.prototype.commit;
+  Accounts.prototype.commit = async function (state) {
+    if (failPlanCommits && state.accounts.some((a) => a.plan && a.plan.tier === "paid")) {
+      throw new Error("disk full");
+    }
+    return realCommit.call(this, state);
+  };
+  t.after(() => { Accounts.prototype.commit = realCommit; });
+
+  // the verify records the payment but cannot grant the plan: 503, honestly
+  const first = await payInvoice(acct.token, invoice, { receipt, txHash: healHash });
+  assert.equal(first.status, 503);
+  assert.match(JSON.parse(first.body).error, /recorded/i);
+
+  // the payment is durably on disk even though the plan never landed
+  const rawInvoices = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8"));
+  const stranded = rawInvoices.invoices.find((i) => i.id === invoice.invoiceId);
+  assert.equal(stranded.status, "paid");
+  const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  assert.equal(mine.plan, "free");
+
+  // the retry — the same payment verified again — applies the plan once
+  failPlanCommits = false;
+  const second = await payInvoice(acct.token, invoice, { receipt, txHash: healHash });
+  assert.equal(second.status, 200);
+  const healed = JSON.parse(second.body);
+  assert.equal(healed.status, "paid");
+  assert.equal(healed.alreadyPaid, true);
+  assert.ok(healed.paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "one payment, one 30-day window");
+  assert.ok(healed.paidUntil < Date.now() + 30 * 24 * 60 * 60 * 1000 + 5000, "and not a day more");
+  const stored = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "accounts.json"), "utf8"));
+  const mineAfter = stored.accounts.find((a) => a.email === "heal-payer@example.com");
+  assert.equal(mineAfter.plan.appliedInvoices.length, 1, "the retry granted the entitlement exactly once");
+  assert.deepEqual(mineAfter.plan.appliedInvoices.map((a) => a.paidUntil), [healed.paidUntil]);
+
+  // and replay protection held through the crash: the same transaction
+  // cannot pay a new invoice
+  const inv2 = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${acct.token}` } })).body);
+  const replay = await payInvoice(acct.token, inv2, { receipt, txHash: healHash });
+  assert.equal(replay.status, 402);
+  assert.match(JSON.parse(replay.body).error, /already used/i);
 });
 
 after(() => new Promise((resolve) => server.close(() => resolve())));
