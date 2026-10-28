@@ -70,3 +70,31 @@ account-free share links. Zero runtime dependencies — Node stdlib only.
 - No accounts, no published limits, no per-clip listing on the server — post #18.
 - Seeking in unpatched webm (when the patcher fails) is limited; playback still
   works.
+
+## Running the E2E in this dev container (2026-10-28)
+
+The session container is Debian bookworm with almost no shared libraries, so
+headless Chrome needs hand-setup before `node e2e/record.mjs` will run:
+
+1. `npx puppeteer browsers install chrome` (binary lands in ~/.cache/puppeteer).
+2. `apt-get` cannot install (no root), so download the debs into /tmp and
+   extract them locally: `apt-get -o Dir::State::lists=/tmp/aptlists
+   -o Dir::Cache=/tmp/aptcache update` then `... download <pkgs>` and
+   `dpkg-deb -x <deb> /tmp/chrome-deps/` for each. Needed (incl. transitives):
+   libglib2.0-0 libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0
+   libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
+   libxkbcommon0 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 libx11-6
+   libxcb1 libxext6 libavahi-client3 libavahi-common3 libxau6 libxdmcp6
+   libdrm2 libwayland-server0 libpixman-1-0 libfontconfig1 libfreetype6
+   libpng16-16 libxcb-shm0 libxcb-render0 libxrender1 libfribidi0 libthai0
+   libharfbuzz0b libxi6 libbsd0 libdatrie1 libgraphite2-3 libsqlite3-0,
+   plus `fontconfig-config fonts-dejavu-core` for fonts.
+3. Run with `LD_LIBRARY_PATH=/tmp/chrome-deps/usr/lib/x86_64-linux-gnu:/tmp/chrome-deps/lib/x86_64-linux-gnu`.
+   Missing libsqlite3-0 shows up as a fatal NSS error (nss_error=-5925), not a
+   loader error — that cost real time once.
+4. Fontconfig finds no fonts by default and Chrome *aborts* (SIGABRT in Skia,
+   "SkFontMgr_FontConfigInterface: Not implemented") when it must render text
+   with none. Point it at extracted fonts: write a minimal fonts.conf listing
+   `<dir>`/usr/share/fonts, and run with `FONTCONFIG_PATH` set to it.
+5. CI does not need any of this: build.yml runs only `npm test` (the 13 API
+   tests, no browser). The E2E is a dev-time gate before asking for a push.
