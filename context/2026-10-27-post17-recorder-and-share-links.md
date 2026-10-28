@@ -324,3 +324,67 @@ re-verified the branch rather than re-doing work:
 - The booked reminder for the marker-clip verification was closed: its
   answer was already posted in the thread at 13:22 UTC.
 - Push queued at this head so the platform reviews it (round 4).
+
+## Review round 4 work (2026-10-28 ~19:30 UTC) — merge of moved main, one real product bug, full suites green
+
+Round 4 asked for the corrected E2E to run against a dev preview serving the
+reviewed branch, plus the human desktop-Chrome verification. What this session
+did:
+
+- **Merged the moved main again** (506cd5f, post-18's save-state work:
+  `saveOp`/stale-callback guards, `discardPendingRecording`,
+  per-account recording caches, sign-out clearing, `/webm-patch.js`) into
+  post-17 and reconciled it with the reviewed lifecycle work by hand in
+  `public/recorder.html` and `e2e/record.mjs`; `test/server.test.js` merged
+  with three of the ported upload tests switched to structurally honest webm
+  payloads (main's server verifies the duration from the file itself, so
+  random-byte uploads are refused — the ported tests never ran against that).
+- **A real product bug, found by actually running the E2E**: main's
+  recorder.html declared `const patchWebmDuration = self.OpenLoomWebmPatch.patchWebmDuration;`
+  at top level while `lib/webm-patch.js` declares `async function
+  patchWebmDuration` — two top-level bindings of the same name across classic
+  scripts throw "Identifier has already been declared" and kill the ENTIRE
+  inline script: the studio page is dead on main. Post-18 switched the script
+  src without running a browser E2E (their container has no Chrome). Fixed in
+  the merge; the fix rides into main with it.
+- **Three E2E test bugs from main, all in checks that had never been
+  executed**: (a) the manage-key leak check searched `body.innerHTML`, which
+  matches the page's own inline script text that builds manage hrefs —
+  replaced with an element-scoped check (no anchor points at `?k=`, no input
+  carries one); (b) the switch-during-upload check expected a status message
+  the reviewed stale-callback guard deliberately suppresses — it now asserts
+  the silent drop (result hidden, no links, no leak) and checks the clip's
+  survival through the API and the owner's cache; (c) the stale-completion
+  check clicked Start from a result screen — now goes through
+  "Record another" first.
+- **Chrome 156 download behaviour**: an unscoped `Browser.setDownloadBehavior`
+  applies only to the default browser context; the stale-completion page runs
+  in its own context, so its download of a pending recording went nowhere.
+  The E2E now scopes the policy with `BrowserContext.setDownloadBehavior`.
+- **Timer checks anchored on the test's clock.** Page-clock display windows
+  (`±1s` on the shown timer) failed intermittently under multi-second
+  main-thread stalls in this loaded container — the page's own
+  `performance.now()` age inflated consistently, and an isolated repro of the
+  same code passed cleanly, so it is environment noise, not a product bug.
+  The checks now compare the page-internal recording age against the test's
+  own wall clock (a page cannot run ahead of it): a stale `recordStart` — the
+  round-3 bug these checks guard — still fails by many seconds.
+- **Results at head**: `npm test` 87/87; `node e2e/record.mjs` all 49 checks
+  pass, including the pending-recording download (the fix verified:
+  `recording.webm` lands in the download dir) and the byte-identical viewer
+  download.
+- **The branch-serving preview is not runnable from this side.** The dev
+  preview was fingerprinted by content hash: `/` serves main's recorder.html
+  at e763627 exactly (`uploadXhr` present, `saveOp` absent) — stale main, not
+  this branch, not current main. The deploy pipeline is platform-owned, and
+  the review's own note says the platform team must make the branch available
+  for checks. Asked for in the post thread; the corrected E2E runs against the
+  preview as soon as it serves the branch (the script takes any baseUrl).
+- **Human desktop-Chrome picker verification**: still arranged via the
+  attention record (owner team, due 2026-10-29T18:00Z) — not duplicated. The
+  steps it names are the ones the review asks to be recorded: record through
+  the real screen picker with a microphone, then a separate viewer session
+  plays the clip, downloads it byte-identically, and the author deletes it.
+- The container-replacement persistence results above (marker clip verified
+  for playback, byte-identical download and deletion across two pushes) are
+  retained and still stand.
