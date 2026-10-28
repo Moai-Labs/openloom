@@ -1210,6 +1210,45 @@ test("the multi-cluster evasion shape is measured in full and refused over the c
   await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
 });
 
+test("an upload whose sibling-terminated cluster lacks a Timestamp is refused — nothing is retained", async () => {
+  // the upload-side twin of the scanner regressions above: the same
+  // malformed fixtures, sent the way the recorder sends files, with a
+  // plausible client-written duration to make sure the header never
+  // rescues a file the scanner could not verify
+  const { token } = await makeAccount("tslessupload@example.com");
+  const headers = {
+    "content-type": "video/webm",
+    "x-duration-ms": "3000", // plausible, within the cap, and irrelevant
+    authorization: `Bearer ${token}`
+  };
+  // no Timestamp in the cluster that a sibling ends — the first one
+  const missingBefore = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, simpleBlock(0), simpleBlock(1000),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0)
+  ]);
+  const before = await request("POST", "/api/clips", { body: missingBefore, headers });
+  assert.equal(before.status, 413);
+  assert.match(JSON.parse(before.body).error, /could not be verified|minute/i);
+
+  // and the successor — a Timestamp-less cluster after a good one
+  const missingAfter = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(0),
+    CLUSTER_UNKNOWN, simpleBlock(1000)
+  ]);
+  const after = await request("POST", "/api/clips", { body: missingAfter, headers });
+  assert.equal(after.status, 413);
+  assert.match(JSON.parse(after.body).error, /could not be verified|minute/i);
+
+  // neither upload left anything behind: no metadata, no file
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")), []);
+  const me = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${token}` } })).body);
+  assert.equal(me.usage.clips, 0);
+  assert.equal(me.usage.bytes, 0);
+});
+
 // --- round 5: the recorder's Duration patch, exercised verbatim -------------
 
 // A MediaRecorder-shaped webm whose Info body is padded with a Void so the

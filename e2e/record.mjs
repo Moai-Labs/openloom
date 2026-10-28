@@ -104,8 +104,17 @@ async function signUp(page, email) {
   await fill(page, "#email", email);
   await fill(page, "#password", "correct horse battery");
   await page.click("#authBtn");
-  await page.waitForFunction(() =>
-    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const appeared = await page.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 5000 })
+    .then(() => true, () => false);
+  if (!appeared) {
+    // a dev stack that already ran this suite holds the account: sign in
+    // instead of signing up — same credentials, same session from here on
+    await page.click("#authToggle");
+    await page.click("#authBtn");
+    await page.waitForFunction(() =>
+      !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  }
   return page.$eval("#whoami", (el) => el.textContent);
 }
 
@@ -827,11 +836,15 @@ async function main() {
     exported?.head?.slice(0, 60));
 
   // 13. persistence: back up, wipe, restore — the clip list and files come back
-  let authorToken = null;
+  // the author's session, captured before any restart touches the page
+  const authorSession = await authorPage.evaluate(() => ({
+    token: localStorage.getItem("openloom.token"),
+    email: localStorage.getItem("openloom.email")
+  }));
+  let originMoved = false;
   if (dataDir) {
     const metaPath = new URL(shares[1]).pathname.replace("/v/", "/api/clips/");
     const before = await (await fetch(baseUrl + metaPath)).json();
-    authorToken = await authorPage.evaluate(() => localStorage.getItem("openloom.token"));
     const backupDir = dataDir + "-backups";
     execFileSync(process.execPath, ["scripts/backup.mjs", "--dir", backupDir], {
       cwd: REPO, env: { ...process.env, DATA_DIR: dataDir }, stdio: "inherit"
@@ -856,6 +869,7 @@ async function main() {
       child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
     });
     baseUrl = restarted;
+    originMoved = true;
     // the pages still sit on the pre-restart origin, so these go through node
     const afterRes = await fetch(restarted + metaPath);
     const after = { status: afterRes.status, body: afterRes.status === 200 ? await afterRes.json() : null };
@@ -863,7 +877,7 @@ async function main() {
       after.status === 200 && after.body.bytes === before.bytes,
       `status ${after.status}`);
     const stillSignedIn = (await fetch(restarted + "/api/me", {
-      headers: { Authorization: "Bearer " + authorToken }
+      headers: { Authorization: "Bearer " + authorSession.token }
     })).status;
     check("accounts survive the restore too", stillSignedIn === 200, `me returned ${stillSignedIn}`);
   } else {
@@ -872,13 +886,17 @@ async function main() {
     console.log("INFO  backup/restore skipped: a remote baseUrl was given");
   }
 
-  // 14. delete everything — on the restarted server, still signed in
-  // (the restart moved ports, so the new origin gets the session back)
-  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
-  await authorPage.evaluate(([t, email]) => {
-    localStorage.setItem("openloom.token", t);
-    localStorage.setItem("openloom.email", email);
-  }, [authorToken, "author@example.com"]);
+  // 14. delete everything — still signed in
+  if (originMoved) {
+    // the restart moved ports, so the new origin gets the session back
+    await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+    await authorPage.evaluate(([t, email]) => {
+      localStorage.setItem("openloom.token", t);
+      localStorage.setItem("openloom.email", email);
+    }, [authorSession.token, authorSession.email]);
+  }
+  // a remote baseUrl keeps its own origin and session; reseeding it here
+  // would clobber the live session with a stale copy
   await authorPage.reload({ waitUntil: "networkidle0" });
   await authorPage.waitForFunction(() => /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 });
   authorPage.on("dialog", (d) => d.accept());
