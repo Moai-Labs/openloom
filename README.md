@@ -41,9 +41,11 @@ npm test           # API tests against a real server on an ephemeral port
 ```
 
 Recordings are stored under `DATA_DIR` (default `./data`): one directory per
-clip with `video.bin` and `meta.json`. The container keeps them in
-`/app/data`, which is currently not a persistent volume — redeploys wipe it
-(persistence is the next build step).
+clip with `video.bin` and `meta.json`. In the deployment the clips live on a
+persistent volume: `deploy.json` provisions a 5 GB volume mounted at `/data`
+and sets `DATA_DIR=/data`, so clips survive a container replacement — a new
+container opens the same directory, keeps serving the same bytes, and the
+original manage key still deletes the clip.
 
 `e2e/record.mjs` is an end-to-end check in a real headless Chrome: record,
 upload, playback in a separate context, byte-identical download, deletion from

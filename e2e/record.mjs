@@ -42,6 +42,11 @@ async function startServerIfLocal() {
   });
 }
 
+// Rendered visibility, not a class name: the delete button must be styled
+// out of the page for viewers and actually shown for the manage key.
+const DELETE_VISIBLE = (el) =>
+  !!el && getComputedStyle(el).display !== "none" && el.getClientRects().length > 0;
+
 const BROWSER_FLAGS = [
   "--use-fake-ui-for-media-stream",
   "--use-fake-device-for-media-stream",
@@ -78,7 +83,7 @@ const FAKE_GET_DISPLAY_MEDIA = `
   };
 `;
 
-async function recordAClip(browser, title) {
+async function recordAClip(browser, title, opts = {}) {
   const page = await browser.newPage();
   let usedSyntheticSource = false;
 
@@ -89,10 +94,18 @@ async function recordAClip(browser, title) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   await page.type("#title", title);
 
+  if (opts.forceSyntheticDisplay) {
+    // used for the display-audio + microphone regression: the synthetic
+    // source carries display audio, the fake device provides the microphone
+    await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+    usedSyntheticSource = true;
+  }
+
   await page.click("#startBtn");
   try {
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
   } catch {
+    if (opts.forceSyntheticDisplay) throw new Error("recording did not start with both audio sources");
     // headless Chrome often cannot open the real picker: inject a synthetic
     // capture source and record again
     usedSyntheticSource = true;
@@ -122,6 +135,20 @@ async function recordAClip(browser, title) {
   });
   result.usedSyntheticSource = usedSyntheticSource;
   result.mime = await page.evaluate(() => (typeof pendingBlob !== "undefined" ? pendingBlob.type : ""));
+  if (opts.expectAudio) {
+    // the recorded clip must actually carry an audio track: decode it in the
+    // page and require a non-empty audio stream
+    result.hasAudio = await page.evaluate(async () => {
+      try {
+        const buf = await pendingBlob.arrayBuffer();
+        const ctx = new AudioContext();
+        const decoded = await ctx.decodeAudioData(buf);
+        const ok = decoded.duration > 0 && decoded.numberOfChannels >= 1;
+        await ctx.close();
+        return ok;
+      } catch { return false; }
+    });
+  }
   await page.close();
   return result;
 }
@@ -141,6 +168,17 @@ async function main() {
   check("recording produced a share link", /^http.*\/v\/[A-Za-z0-9_-]+$/.test(author.share), author.share);
   check("recording produced a manage link", author.manage.includes(author.share.split("/v/")[1]), author.manage);
 
+  // 1b. regression: Chrome's picker can supply display audio while the
+  // microphone is also on — the two must be mixed into one track, recording
+  // must start, and the resulting clip must carry audio
+  const dual = await recordAClip(browser, "Dual audio regression", {
+    forceSyntheticDisplay: true,
+    expectAudio: true
+  });
+  check("recording starts with display audio and microphone together",
+    /^http.*\/v\/[A-Za-z0-9_-]+$/.test(dual.share), dual.share);
+  check("the dual-source clip contains audio", dual.hasAudio === true, String(dual.hasAudio));
+
   // 2. a viewer without any cookies or storage opens the share link
   const viewerContext = await browser.createBrowserContext();
   const viewer = await viewerContext.newPage();
@@ -148,11 +186,11 @@ async function main() {
   const playback = await viewer.waitForFunction(() => {
     const v = document.querySelector("video");
     return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
-  }, { timeout: 30000 }).then(() => viewer.evaluate(() => ({
-    duration: document.querySelector("video").duration,
-    title: document.getElementById("clipTitle").textContent,
-    deleteVisible: !document.getElementById("deleteBtn").classList.contains("hidden")
-  })), () => null);
+  }, { timeout: 30000 }).then(async () => ({
+    duration: await viewer.evaluate(() => document.querySelector("video").duration),
+    title: await viewer.evaluate(() => document.getElementById("clipTitle").textContent),
+    deleteVisible: await viewer.evaluate(DELETE_VISIBLE, await viewer.$("#deleteBtn"))
+  }), () => null);
   check("share link plays for a viewer", !!playback, playback ? `${playback.duration.toFixed(1)}s, "${playback.title}"` : "video metadata never resolved");
   if (playback) check("viewer does not see a delete button", !playback.deleteVisible);
 
@@ -180,6 +218,12 @@ async function main() {
   const manager = await managerContext.newPage();
   await manager.goto(author.manage, { waitUntil: "networkidle0" });
   manager.on("dialog", (d) => d.accept());
+  // the manage key must render the delete button, not merely carry the class
+  const managerSeesDelete = await manager.waitForFunction(() => {
+    const el = document.getElementById("deleteBtn");
+    return !!el && getComputedStyle(el).display !== "none" && el.getClientRects().length > 0;
+  }, { timeout: 10000 }).then(() => true, () => false);
+  check("manage key shows a clickable delete button", managerSeesDelete);
   await manager.click("#deleteBtn");
   await manager.waitForFunction(() => document.getElementById("note")?.textContent.includes("deleted"), { timeout: 15000 })
     .then(() => check("manage link deletes the clip", true))
