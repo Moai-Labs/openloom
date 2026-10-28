@@ -92,3 +92,230 @@ dependencies — Node stdlib only.
 - Accounts are a single JSON file; hundreds of thousands of users would need
   a database.
 - Restore expects the server to be stopped (the script moves files).
+
+## Session 3 (2026-10-27, ~17:20 UTC)
+
+Delivery session. The previous session's queued push had not landed (no
+post-18 ref on origin, no CI verdict), so this session re-verified and
+re-queued:
+
+- Merged origin/main (6646234: CI now builds to the app's fly registry;
+  deploy.json image field changed by the platform). Merge is clean;
+  `volume_gb: 5` and `DATA_DIR=/data` survive alongside it.
+- `npm test`: 27/27 pass on the merged head.
+- E2E re-run NOT possible on this machine: fresh container, no Chrome system
+  libraries, no root to install them. The merged diff contains no product
+  code, so the previous session's full green E2E run on identical code stands.
+- Committed the e2e toolchain as devDependencies (puppeteer@23, yauzl) plus
+  package-lock, so the E2E is installable from the repo on any machine with
+  Chrome's system libs.
+- Push queued via request_push. Remaining: CI verdict + preview link (next
+  session's first job), and the open platform question on the real volume
+  mount path for DATA_DIR.
+
+## Review round 1 (2026-10-27, later session): the four required changes
+
+The platform review of 5fe5a2f asked for four changes. All four are made on
+this branch; decisions taken:
+
+- **accounts.js — serialized, copy-on-write persistence.** Every account
+  mutation (create/login/logout/remove) and its persistence commit now runs
+  through one queue (`runExclusive`), so two signups can no longer interleave
+  writes into `accounts.json.tmp`. Each commit writes a uniquely owned temp
+  file (`accounts.json.<pid>.<seq>.<rand>.tmp`), fsyncs, then atomically
+  renames — a rename can no longer fail with ENOENT because another writer
+  renamed the shared temp away. Mutations are copy-on-write: the new state is
+  committed first and only then becomes live, and a failed commit rolls memory
+  back, so no uncommitted account/session stays active. `save()` remains as a
+  queued commit for outside callers; `pruneSessions`/`dropSessionsOf` were
+  folded into create/login/remove (nothing external called them). New tests:
+  8 concurrent signups + a duplicated-email race, verified after "restarting"
+  (fresh `Accounts` over the same directory); 5 logins racing 5 logouts; a
+  pre-restart session token still authenticating post-restart; no stray .tmp.
+- **store.js — scoped cleanup, real teardown.** Failed/empty uploads now
+  remove only their own staging file (the old `rm(path.dirname(staging),
+  {recursive:true})` deleted the *shared* tmp directory and every in-flight
+  upload with it). On failure the pipeline is torn down in flow order —
+  unpipe, destroy counting and output streams, wait for the output file's
+  `close` — and only then is the file removed; the request is drained (not
+  destroyed) so the error response still reaches the client. New test: an
+  oversized upload pushed past the cap mid-flight while a valid upload
+  streams concurrently — the valid one survives with its file intact and the
+  tmp dir ends empty.
+- **webm-duration.js — duration from the media timeline, fail closed.** The
+  old parser read only `Info.Duration` — a client-writable float, useless as
+  enforcement (a 5-minute video claiming 1 s passed). It is now a streaming
+  EBML scanner that measures the actual timeline: Cluster Timestamps plus
+  SimpleBlock/Block timecodes, finished with the last frame's length (its
+  BlockDuration, else the gap to the previous block, capped at 2 s).
+  `Info.Duration` is deliberately never read. The server streams the whole
+  stored file through the scanner (no 1 MB head cut, so nothing at the tail
+  is missed) and: refuses any webm/matroska whose timeline cannot be verified
+  at all (fail closed — no more client-declared fallback), refuses over-cap
+  timelines, and records the *verified* duration even when the header
+  disagrees. Known boundary: non-webm uploads (mp4) still carry only the
+  declared header — noted in the thread. Tests: understated `Info.Duration`
+  (1 s claimed, 40 s timeline → refused), missing Duration, unverifiable
+  bytes → 413, streaming scanner fed at 1/3/7/4096-byte chunks equals the
+  buffered read. Two scanner bugs found and fixed while testing: skip
+  accounting after reading a block's timecode, and small elements (Cluster
+  Timestamp, TimestampScale, BlockDuration) whose bodies span a chunk
+  boundary being discarded as "unknown" instead of awaited.
+- **recorder.html — the manage-key cache is account-scoped.** Previously
+  *every* authenticated upload went into the global `openloom.recordings`
+  list, which `deviceCard` renders signed out — handing the departing
+  creator's clip list and deletion keys to whoever opens the browser next.
+  Now: recordings made while signed in are cached under
+  `openloom.recordings:<email>` and render only while that account is
+  authenticated; the global key holds only genuine no-account recordings from
+  the pre-accounts build, and the card's copy now says exactly that. Sign-out
+  and account switches clear the rendered list at once, and a list response
+  that was in flight during the switch is discarded (token captured before
+  the fetch, compared after) so it cannot repopulate the page. Deleting the
+  account removes its cache. The browser scenario in `e2e/record.mjs` signs
+  out and signs in as another creator on the same profile and asserts no rows
+  and no `?k=` manage links anywhere on the page.
+- Related fix found while re-reading the path: the declared-duration
+  prefilter refused at exactly the cap, but the recorder's auto-stop fires up
+  to a timer tick *after* the cap — a legitimate 5-minute recording could be
+  refused on its declared header. The prefilter now uses the same +2 s slop
+  as the real (timeline) check.
+
+## Session (2026-10-28): re-verify and re-queue for review
+
+The review of 58bae54 could not be had last session and the post was paused;
+the platform has since re-taken it up. This session: merged origin/main
+(da4f51e, build-workflow/image-name changes — the only product-adjacent file
+is `.github/workflows/build.yml`, no product code changed) into post-18 at
+b6df32e, re-ran the full suite on the merged head — 33/33 pass. All four
+round-1 changes re-verified present in the source (accounts mutation queue
+with unique temp files and rollback; per-upload staging teardown; timeline
+scanner ignoring Info.Duration; account-scoped manage-key cache). Push
+re-queued so the merged head gets the review.
+
+## Session (2026-10-28): review round 2 — duration fail-closed + account-switch scoping
+
+The interrupted session had drafted both round-2 changes; this session finished,
+reviewed and corrected them.
+
+- **webm-duration.js — fail closed on an unverifiable timeline.** end() now
+  returns null whenever the complete media timeline cannot be established:
+  the walk stopped on malformed/unsupported input (fail() at every unknown
+  element), the input ended inside an element or a known-size context
+  (eof/truncated, skip>0, declared context end not reached), or an element
+  overruns its parent's boundary. The last frame's length now comes only
+  from what the file asserts, in full: an explicit BlockDuration counts
+  verbatim however long (the old 2 s cap replaced it with 0 — a block at
+  timestamp 0 with a 10-minute BlockDuration reported 0 ms and slipped under
+  the cap), the track's DefaultDuration asserts plain blocks, and laced
+  blocks measure frames × DefaultDuration; a laced block whose track asserts
+  no frame duration is refused rather than measured by guessing. The gap
+  fallback survives only for the latest block, which is what keeps genuine
+  MediaRecorder output (no asserted durations at all) verifiable.
+- **recorder.html — account scoping by captured owner.** The account is
+  captured when the recording starts (pendingOwnerEmail) and the token when
+  the save starts (ownerToken); cache writes go to the captured owner
+  (rememberLocally(data, ownerEmail, ownerTitle)) and upload completions
+  render nothing account-specific when the signed-in owner has changed.
+  Sign-out, account switch and account deletion clear the result links and
+  the departing account's pending recording/preview (clearDepartedAccountState);
+  an in-flight recording's onstop discards quietly (droppingRecording) and a
+  pending save refuses to submit under the successor's session. Stale-session
+  guards (sessionChanged) cover refreshAccount() and overClipLimit(); the
+  vendor fix-webm-duration dependency is replaced by an in-page head-only
+  webm duration patch (no third-party script in the upload path).
+- **Fixes found re-reading the interrupted session's draft:** the stale-upload
+  completion path called clearDepartedAccountState(), which would have torn
+  down the *successor's* active recording (stopped their capture, dumped them
+  to setup) — late callbacks now only discard the stale recording's own
+  fields (discardPendingRecording). A 401 on a stale captured token in
+  renderServerClips() and in the save handler called signOut() unconditionally,
+  signing out whoever is signed in now — both now check the session/token is
+  still the current one.
+- **Tests.** 42/42 API tests (was 33): new unit + 413 tests for a
+  short-start block with an over-cap BlockDuration, over-cap DefaultDuration
+  and laced durations, a laced block with no assertable frame duration,
+  malformed input after a readable timeline, truncated input, and an element
+  overrunning its parent's boundary. Browser tests 4c/4d added to
+  e2e/record.mjs: sign-out from the saved-result screen (links cleared, no
+  ?k= anywhere, successor's UI and cache clean, owner's own cache intact for
+  their next session) and an upload response held until after an account
+  switch (no owner links or keys in the successor's UI/cache, the clip saved
+  to the account that submitted it, its manage key in the owner's cache).
+  The browser E2E still cannot run on this lane's machine (no Chrome system
+  libraries, no root); it is written to run in CI and on the dev stack.
+
+## Session (2026-10-28): review round 4 — deferred block measurement, universal verification, per-save state, size-vint widths
+
+Round 3 (86b103a) had landed; this session made the four round-4 changes at
+5074fa7. Suite: 84/84 (was 70).
+
+- **webm-duration.js — blocks measured only on a verified Cluster
+  Timestamp.** The old code substituted `cluster.timeTicks ?? 0`, so a block
+  followed by a ten-minute Cluster Timestamp measured near zero and the later
+  Timestamp never corrected it. Blocks are now measured into a per-cluster
+  accumulator (`newClusterAcc()`) in nanoseconds *relative to their own
+  cluster* — order inside the cluster no longer matters — and
+  `resolveCluster()` folds the accumulator onto the segment timeline only
+  when the cluster ends with a Timestamp. A cluster holding blocks that ends
+  with no Timestamp, or carries two Timestamps that disagree, is refused
+  rather than measured from zero (equal repeats are allowed). Boundary gaps
+  between clusters are computed at resolve time (first block of the next vs
+  last block of the previous), then overridden by the last forward jump
+  inside the new cluster — the same gap semantics as before, reproduced
+  across the deferral. Clusters still open at eof (unknown-size, how live
+  recordings end) resolve in `end()`. Also hardened while there: TimestampScale
+  0 is refused (it stops the clock) and two TimestampScale elements that
+  disagree are refused (the timeline would have no single meaning); the first
+  scale — including a non-default one — is still accepted. Tests: blocks
+  before a 600 s Timestamp measure 602 s across chunk sizes 1–4096; missing
+  Timestamp → null; conflicting Timestamps → null; equal repeat → 2 s; zero
+  scale and disagreeing scales → null.
+- **server.js — every upload verified from its file.** The scan used to run
+  only when the client's Content-Type contained webm/matroska; relabeling an
+  MP4 or a webm-as-MP4 slipped past. Now every accepted upload is streamed
+  through the scanner unconditionally: an unverifiable file (an MP4, garbage)
+  is refused 413, an over-cap timeline refused whatever the label. The media
+  format is determined from the stored file itself — `readWebmDocType()`
+  reads the EBML header's DocType from the first 4 KB — and the clip is
+  relabelled: matroska → video/matroska + .mkv, otherwise video/webm +
+  .webm, so the request's Content-Type no longer decides what is stored.
+  The declared-duration prefilter stays as an early rejection (it can only
+  refuse early, never bypass). Tests: over-cap MP4 → 413 /verif/; over-cap
+  webm under a video/mp4 label → 413 /minute/; within-cap webm under
+  video/mp4 stored as video/webm; a matroska DocType stored as
+  video/matroska; blocks-before-over-cap-Timestamp upload → 413, and the
+  same ordering within the cap records the correct 2 s (the old read said 0).
+- **recorder.html — each save is its own operation.** `discardPendingRecording()`
+  used to clear shared globals, so a departed owner's late upload completion
+  erased the successor's pending blob/title/owner, and a stale patch
+  completion assigned `pendingBlob` before its owner check. Now every
+  `saveRecording()` run captures an op object (`saveOp`) plus its own locals;
+  every progress/completion/failure callback checks `stale()` and returns
+  without touching shared state when superseded. The patched blob is stored
+  only if the op still owns the page (the check moved before the assign);
+  `discardPendingRecording(op)` clears only when its op is still current;
+  `againBtn`, `discardBtn`, account teardown and a new recording all
+  invalidate in-flight ops; the write-only `uploadXhr` global is gone.
+  `rememberLocally` still runs for a stale-but-successful upload — the clip
+  exists and the key belongs in its owner's cache regardless of the UI.
+  Browser regression added to e2e/record.mjs (scenario 4e): A's upload held
+  in interception, A signs out, B signs in and records/saves, A's upload is
+  released — B's result screen, list and state stay intact, B records again,
+  the save is stubbed to fail once, B downloads their own pending blob
+  (CDP download dir) and retries to a clean result. Still not runnable on
+  this lane's machine (no Chrome system libs); runs in CI/dev.
+- **lib/webm-patch.js — the Duration patch shared verbatim.** The recorder's
+  inline webmVint/webmChildren/webmSizeVint/patchWebmDuration moved into a
+  UMD module served at /webm-patch.js (CSP 'self' allows it) and required by
+  the tests, so a patch the tests accept is the patch recordings get.
+  `webmSizeVint` was fixed: it always wrote the 0x80 marker, so a two-byte
+  size (e.g. an Info body of 128) declared itself zero-length and corrupted
+  the structure; it now marks 0x80/0x40/0x20… by width, computes with
+  `256 ** k` (no 32-bit shifts), and rejects values outside the ordinary
+  vint range. Tests: exact encodings at 0/126/127/128/16382/16383/16384 and
+  2^21−2, round-trip decode, RangeError bounds; patch fixtures whose Info
+  body lands exactly on 126/127/128/16382/16383/16384 bytes — each patched
+  file's Info size vint has the right width and value and the media timeline
+  still scans to 4 s; the 128 fixture uploads through the API → 201;
+  /webm-patch.js is served and the page loads it with no inline copies left.

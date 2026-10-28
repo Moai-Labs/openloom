@@ -24,8 +24,10 @@ process.env.PAID_MAX_TOTAL_BYTES = String(13 * 1024);
 
 const server = require("../server.js");
 const { Store } = require("../lib/store");
+const { Accounts } = require("../lib/accounts");
 const { readTar } = require("../lib/tar");
-const { readWebmDurationMs } = require("../lib/webm-duration");
+const { readWebmDurationMs, WebmDurationScanner } = require("../lib/webm-duration");
+const webmPatch = require("../lib/webm-patch");
 const payments = require("../lib/payments");
 
 // The server listens inside its own async boot; wait for the port.
@@ -84,7 +86,9 @@ async function uploadClip(token, { payload, bytes = 2048, title, durationMs, con
   };
   if (title !== undefined) headers["x-title"] = encodeURIComponent(title);
   if (durationMs !== undefined) headers["x-duration-ms"] = String(durationMs);
-  const body = payload || crypto.randomBytes(bytes);
+  // the server verifies a webm's duration from the file itself, so the
+  // default payload is a real one whose media timeline matches the header
+  const body = payload || webmPayload(bytes, durationMs ?? 1000);
   const res = await request("POST", "/api/clips", { body, headers });
   return { res, clip: res.status === 201 ? JSON.parse(res.body) : null };
 }
@@ -230,7 +234,7 @@ test("uploads require an account", async () => {
 
 test("full clip lifecycle: create, metadata, play, download, delete by session", async () => {
   const { token } = await makeAccount("lifecycle@example.com");
-  const payload = crypto.randomBytes(2048);
+  const payload = webmPayload(2048, 4200);
   const { res: create, clip } = await uploadClip(token, { payload, title: "Sprint demo #1", durationMs: 4200 });
   assert.equal(create.status, 201);
   assert.match(clip.id, /^[A-Za-z0-9_-]{10,64}$/);
@@ -365,15 +369,18 @@ test("a clip over the size cap is refused and leaves nothing behind", async () =
 
 test("a clip over the duration cap is refused on the declared duration", async () => {
   const { token } = await makeAccount("durcap@example.com");
-  const { res } = await uploadClip(token, { bytes: 1024, durationMs: 30001 });
+  // well past the cap plus the encoder slop the auto-stopped recorder needs
+  const { res } = await uploadClip(token, { bytes: 1024, durationMs: 60000 });
   assert.equal(res.status, 413);
   assert.match(JSON.parse(res.body).error, /free plan/i);
   assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
 });
 
-test("a webm whose real duration exceeds the cap is refused even when the header lies", async () => {
+test("a webm whose real timeline exceeds the cap is refused even when the header and Duration lie", async () => {
   const { token } = await makeAccount("webmcap@example.com");
-  const webm = minimalWebm(40000); // 40 s inside the file, 1 s declared
+  // 40 s of media timeline; both the Info.Duration element and the header
+  // claim one second
+  const webm = minimalWebm(40000, { declaredMs: 1000 });
   const res = await request("POST", "/api/clips", {
     body: webm,
     headers: {
@@ -384,6 +391,71 @@ test("a webm whose real duration exceeds the cap is refused even when the header
   });
   assert.equal(res.status, 413);
   assert.match(JSON.parse(res.body).error, /40|minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
+test("a webm whose BlockDuration stretches the timeline past the cap is refused", async () => {
+  const { token } = await makeAccount("webmblockdur@example.com");
+  // every block timestamp sits at zero, but the file itself says the final
+  // block runs ten minutes — the old read discarded that as too long and
+  // stored the clip as a 0 ms one
+  const webm = webmFile({ blockGroups: [{ clusterMs: 0, relMs: 0, blockDuration: 600000 }] });
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
+test("a webm that parses briefly and then turns malformed is refused — no partial duration", async () => {
+  const { token } = await makeAccount("webmtrunc@example.com");
+  // 8 s of readable timeline, then garbage where a further element would be
+  const webm = Buffer.concat([minimalWebm(8000), Buffer.from([0x00, 0x01, 0x02])]);
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /verif/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
+test("a webm with an omitted Duration is still enforced from its timeline", async () => {
+  const { token } = await makeAccount("webmnodur@example.com");
+  const over = await request("POST", "/api/clips", {
+    body: minimalWebm(40000, { omitDuration: true }),
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(over.status, 413);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+  const ok = await request("POST", "/api/clips", {
+    body: minimalWebm(8000, { omitDuration: true }),
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(ok.status, 201);
+  const clip = JSON.parse(ok.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 8000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("a webm that carries no verifiable timeline is refused — fail closed", async () => {
+  const { token } = await makeAccount("webmgarbage@example.com");
+  // a header can claim anything, so bytes the parser cannot read cannot be stored
+  const res = await uploadClip(token, { payload: crypto.randomBytes(2048), durationMs: 1000 });
+  assert.equal(res.res.status, 413);
+  assert.match(JSON.parse(res.res.body).error, /verif/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+  // a webm-shaped file with Info but no cluster timestamps either
+  const noTimeline = await uploadClip(token, { payload: webmPayload(512, 1000, { noTimeline: true }), durationMs: 1000 });
+  assert.equal(noTimeline.res.status, 413);
+  assert.match(JSON.parse(noTimeline.res.body).error, /verif/i);
   assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
 });
 
@@ -401,10 +473,301 @@ test("a webm within the cap gets its parsed duration recorded", async () => {
   await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
 });
 
-test("the parser reads real durations", () => {
+test("the parser reads real durations from the media timeline", () => {
   assert.equal(readWebmDurationMs(minimalWebm(6500)), 6500);
+  // an understated Info.Duration is ignored in favour of the block timecodes
+  assert.equal(readWebmDurationMs(minimalWebm(6500, { declaredMs: 1 })), 6500);
   assert.equal(readWebmDurationMs(Buffer.from("not a webm")), null);
   assert.equal(readWebmDurationMs(Buffer.alloc(0)), null);
+});
+
+test("an asserted BlockDuration counts in full, however long", () => {
+  // a block at timestamp zero whose explicit BlockDuration says ten minutes:
+  // the file's own word, and never to be discarded in favour of a shorter read
+  const webm = webmFile({ blockGroups: [{ clusterMs: 0, relMs: 0, blockDuration: 600000 }] });
+  assert.equal(readWebmDurationMs(webm), 600000);
+});
+
+test("a track DefaultDuration counts in full, however long", () => {
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 600e9 }],
+    spans: [[0, 0]]
+  });
+  assert.equal(readWebmDurationMs(webm), 600000);
+});
+
+test("a laced block is measured through its frame count and the track default", () => {
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 600e9 }],
+    laced: [{ clusterMs: 0, relMs: 0, frames: 2 }]
+  });
+  assert.equal(readWebmDurationMs(webm), 1200000);
+  // within the cap: two 33 ms frames from the default
+  const sane = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 33e6 }],
+    laced: [{ clusterMs: 0, relMs: 0, frames: 2 }]
+  });
+  assert.equal(readWebmDurationMs(sane), 66);
+});
+
+// Feeds a file to a scanner `size` bytes at a time; Infinity pushes it whole.
+function pushedInChunks(buf, size) {
+  const scanner = new WebmDurationScanner();
+  if (size === Infinity) {
+    scanner.push(buf);
+    return scanner.end();
+  }
+  for (let i = 0; i < buf.length; i += size) {
+    scanner.push(buf.subarray(i, Math.min(i + size, buf.length)));
+  }
+  return scanner.end();
+}
+
+// Raw heads for tests that need deliberately malformed structure: the EBML
+// header, an unknown-size Segment, an Info with TimestampScale 1e6.
+function rawWebmHead() {
+  return Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x87, 0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40])
+  ]);
+}
+const CLUSTER_UNKNOWN = Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+function clusterTimestamp(ms) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(ms, 0);
+  return Buffer.concat([Buffer.from([0xe7, 0x84]), b]);
+}
+// A Tracks element with one TrackEntry per {trackNumber, defaultNs}, built
+// apart from webmFile so a test can place it after the clusters.
+function tracksElement(entries) {
+  const body = Buffer.concat(entries.map(({ trackNumber, defaultNs }) => {
+    const durBody = Buffer.alloc(uintBodySize(defaultNs));
+    let v = defaultNs;
+    for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+    const entryBody = Buffer.concat([
+      Buffer.from([0xd7, 0x81, trackNumber]),
+      Buffer.from([0x23, 0xe3, 0x83, 0x80 | durBody.length]), durBody
+    ]);
+    return Buffer.concat([Buffer.from([0xae, 0x80 | entryBody.length]), entryBody]);
+  }));
+  return Buffer.concat([Buffer.from([0x16, 0x54, 0xae, 0x6b, 0x80 | body.length]), body]);
+}
+
+test("Tracks arriving after blocks are refused — a late DefaultDuration must not measure blocks short", () => {
+  // a block at timestamp zero with no Tracks in sight reads as 0 ms; a
+  // ten-minute DefaultDuration declared behind it would then govern
+  // playback while the measured timeline stays at zero. The scanner never
+  // reconciles metadata that arrives late: the ordering itself is refused.
+  const base = webmFile({ spans: [[0, 0]] }); // Info + one block at ts 0, no Tracks
+  const late = Buffer.concat([base, tracksElement([{ trackNumber: 1, defaultNs: 600e9 }])]);
+  assert.equal(readWebmDurationMs(late), null);
+  for (const size of [4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(late, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a track that scales its own timestamps is refused, not silently skipped", () => {
+  // TrackTimestampScale changes how the track's blocks map onto the segment
+  // timeline — supported playback runs at a speed the measured timeline
+  // does not describe. The scanner cannot verify that clock, so the file is
+  // refused instead of reported at the default scale.
+  const scale = Buffer.alloc(8);
+  scale.writeDoubleBE(2, 0); // playback at half the measured speed
+  const tts = Buffer.concat([Buffer.from([0x23, 0x31, 0x4f, 0x80 | scale.length]), scale]);
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 33e6, extraElements: [tts] }],
+    spans: [[0, 0]]
+  });
+  assert.equal(readWebmDurationMs(webm), null);
+  for (const size of [4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a block whose body cannot hold its header is malformed even with the next element buffered", () => {
+  // the SimpleBlock declares a 2-byte body — one track byte plus one byte of
+  // what should be its timecode — and the next SimpleBlock's bytes sit
+  // directly behind it in the same buffer. Judging the header by what
+  // happens to be buffered would let a short block consume the element that
+  // follows; it is judged against the declared body instead.
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN,
+    clusterTimestamp(0),
+    Buffer.from([0xa3, 0x82, 0x81, 0x00]), // declared body: 2 bytes, a header needs 4
+    // a 5 s block right behind it, complete with a 9-byte body, so the only
+    // defect in the file is the short block's own header
+    Buffer.from([0xa3, 0x89, 0x81, 0x13, 0x88, 0x00, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e])
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("an unknown-size child cannot overrun the bounded parent that encloses it", () => {
+  // a known-size Segment holds an unknown-size Cluster whose SimpleBlock
+  // claims a body running past the Segment's end — and the file physically
+  // carries a Void behind that end, so this is invalid structure, not
+  // truncation. The block is judged against the Segment boundary even
+  // though its immediate parent (the cluster) has none.
+  const bodyBytes = 40;
+  const info = Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x87, 0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40]);
+  const block = Buffer.concat([Buffer.from([0xa3]), sizeVint(60), Buffer.alloc(60, 0x11)]);
+  const segmentSize = info.length + CLUSTER_UNKNOWN.length + clusterTimestamp(0).length + 2 + bodyBytes;
+  const webm = Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67]), sizeVint(segmentSize), // the Segment, size declared
+    info,
+    CLUSTER_UNKNOWN, // the cluster never declares a size
+    clusterTimestamp(0),
+    block, // its body runs 20 bytes past the Segment's declared end
+    Buffer.from([0xec, 0x81, 0x00]) // and a real element follows, past the boundary
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a laced block whose track asserts no frame duration is refused", () => {
+  const webm = webmFile({ laced: [{ clusterMs: 0, relMs: 0, frames: 2 }] });
+  assert.equal(readWebmDurationMs(webm), null);
+});
+
+// --- round 5: blocks are measured only on a verified Cluster Timestamp ------
+// A block's timecode is relative to its own Cluster's Timestamp. Measuring a
+// block before that Timestamp has arrived — substituting zero — reads a
+// block followed by a ten-minute Timestamp as near zero, and nothing later
+// corrects it. The scanner defers every block's measurement to its cluster's
+// exit and refuses a cluster whose Timestamp never arrives or contradicts
+// itself. simpleBlock(): a track-1 SimpleBlock with a relative timecode.
+
+function simpleBlock(relMs) {
+  const body = Buffer.concat([
+    Buffer.from([0x81]), // track number 1
+    (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+    Buffer.from([0x00, 0x00]) // flags and a first payload byte
+  ]);
+  return Buffer.concat([Buffer.from([0xa3]), sizeVint(body.length), body]);
+}
+
+test("blocks met before their cluster's Timestamp are measured once it arrives", () => {
+  // the blocks come first; the Timestamp arrives later and is the base for
+  // every block in the cluster — the ten-minute one lifts them, never zeroes
+  // them. Absolute times: 600000, 601000, 600500; the fallback adds the last
+  // observed frame gap (1000 ms) to the highest timestamp.
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN,
+    simpleBlock(0),
+    simpleBlock(1000),
+    clusterTimestamp(600000),
+    simpleBlock(500)
+  ]);
+  assert.equal(readWebmDurationMs(webm), 602000);
+  for (const size of [4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), 602000, `chunk size ${size}`);
+  }
+});
+
+test("a cluster holding blocks that never names a Timestamp is refused", () => {
+  const webm = Buffer.concat([rawWebmHead(), CLUSTER_UNKNOWN, simpleBlock(0), simpleBlock(1000)]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("two different Cluster Timestamps in one cluster are refused", () => {
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN,
+    clusterTimestamp(0),
+    simpleBlock(0),
+    clusterTimestamp(600000),
+    simpleBlock(1000)
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a repeated equal Cluster Timestamp is allowed", () => {
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN,
+    clusterTimestamp(1000),
+    simpleBlock(0),
+    clusterTimestamp(1000),
+    simpleBlock(500)
+  ]);
+  // absolute 1000, 1500; the fallback adds the observed 500 ms gap
+  for (const size of [Infinity, 4096, 7, 3, 1]) {
+    assert.equal(pushedInChunks(webm, size), 2000, `chunk size ${size}`);
+  }
+});
+
+test("a zero TimestampScale stops the clock and is refused", () => {
+  const head = Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x84, 0x2a, 0xd7, 0xb1, 0x81, 0x00]) // scale 0
+  ]);
+  const webm = Buffer.concat([head, CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(1000)]);
+  assert.equal(readWebmDurationMs(webm), null);
+});
+
+test("two Info elements disagreeing about TimestampScale are refused", () => {
+  const info = (scaleElement) => Buffer.concat([
+    Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x80 | scaleElement.length]), scaleElement
+  ]);
+  const oneMs = info(Buffer.from([0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40])); // 1000000
+  const twoMs = info(Buffer.from([0x2a, 0xd7, 0xb1, 0x83, 0x1e, 0x84, 0x80])); // 2000000
+  const head = Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+  ]);
+  assert.equal(readWebmDurationMs(Buffer.concat([
+    head, oneMs, twoMs, CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(1000)
+  ])), null);
+  // the same scale declared twice agrees with itself and stays readable
+  assert.equal(readWebmDurationMs(Buffer.concat([
+    head, oneMs, oneMs, CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(1000)
+  ])), 1000);
+});
+
+test("malformed input after a readable timeline is refused — no partial duration", () => {
+  const webm = minimalWebm(6500);
+  assert.equal(readWebmDurationMs(Buffer.concat([webm, Buffer.from([0x00, 0x01, 0x02])])), null);
+  assert.equal(readWebmDurationMs(Buffer.concat([webm, Buffer.from([0x53, 0x80])])), null);
+});
+
+test("truncated input after a readable timeline is refused", () => {
+  const webm = minimalWebm(6500);
+  assert.equal(readWebmDurationMs(webm.subarray(0, webm.length - 3)), null);
+  assert.equal(readWebmDurationMs(webm.subarray(0, webm.length - 1)), null);
+});
+
+test("an element that overruns its parent's boundary is refused", () => {
+  const parts = [];
+  parts.push(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
+  parts.push(Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+  parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x83, 0x2a, 0xd7, 0xb1, 0x81, 0x0f, 0x42, 0x40]));
+  // a cluster declaring 10 body bytes whose SimpleBlock claims 20
+  parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x8a]));
+  parts.push(Buffer.from([0xe7, 0x84, 0x00, 0x00, 0x00, 0x00]));
+  parts.push(Buffer.from([0xa3, 0x80 | 20]), Buffer.alloc(20));
+  assert.equal(readWebmDurationMs(Buffer.concat(parts)), null);
+});
+
+test("the streaming scanner matches the buffered read on awkward chunk sizes", () => {
+  for (const step of [1, 3, 7, 4096]) {
+    const webm = minimalWebm(12000);
+    const scanner = new WebmDurationScanner();
+    for (let i = 0; i < webm.length; i += step) {
+      scanner.push(webm.subarray(i, Math.min(i + step, webm.length)));
+    }
+    assert.equal(scanner.end(), 12000, `chunk size ${step}`);
+  }
 });
 
 test("the clip-count cap stops the fourth... and every extra clip", async () => {
@@ -437,7 +800,7 @@ test("the clip-count cap stops the fourth... and every extra clip", async () => 
 
 test("export bundles the manifest and every clip, once per link", async () => {
   const a = await makeAccount("export@example.com");
-  const payload = crypto.randomBytes(1000);
+  const payload = webmPayload(1000, 2000);
   const { clip } = await uploadClip(a.token, { payload, title: "export me", durationMs: 2000 });
 
   const anon = await request("POST", "/api/my/export");
@@ -521,6 +884,95 @@ test("deleting the account removes the clips and every session", async () => {
   await request("DELETE", "/api/my/account", { headers: { authorization: `Bearer ${again.token}` } });
 });
 
+// --- persistence under concurrency -----------------------------------------
+
+test("concurrent signups all persist, with exactly one of a duplicated email", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-accounts-"));
+  const acc = new Accounts(dir);
+  await acc.init();
+  const emails = Array.from({ length: 8 }, (_, i) => `user${i}@racing.example`);
+  const created = await Promise.allSettled(emails.map((e) => acc.create(e, "correct horse battery")));
+  assert.ok(created.every((r) => r.status === "fulfilled"), "8 concurrent signups all succeed");
+  // two racing signups of the same email: exactly one wins
+  const dupe = await Promise.allSettled([
+    acc.create("dupe@racing.example", "correct horse battery"),
+    acc.create("dupe@racing.example", "correct horse battery")
+  ]);
+  const outcomes = dupe.map((r) => r.status);
+  assert.deepEqual(outcomes.sort(), ["fulfilled", "rejected"]);
+
+  // restart: a fresh instance reads the persisted file
+  const restarted = new Accounts(dir);
+  await restarted.init();
+  assert.equal(restarted.data.accounts.length, 9);
+  // every persisted account opens with its password, and no stray .tmp survives
+  for (const email of emails) {
+    const res = await restarted.login(email, "correct horse battery");
+    assert.ok(res.token.length > 20);
+  }
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("a session created before a restart still authenticates after it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-accounts-"));
+  const acc = new Accounts(dir);
+  await acc.init();
+  const { token } = await acc.create("survivor@racing.example", "correct horse battery");
+  assert.ok(await acc.auth(token));
+
+  const restarted = new Accounts(dir);
+  await restarted.init();
+  assert.deepEqual((await restarted.auth(token)).email, "survivor@racing.example");
+
+  // a concurrent logout under load: 5 logins and 5 logouts interleaved
+  const tokens = await Promise.all(
+    Array.from({ length: 5 }, () => restarted.login("survivor@racing.example", "correct horse battery"))
+  );
+  await Promise.all(tokens.map((t) => restarted.logout(t.token)));
+  const after = new Accounts(dir);
+  await after.init();
+  assert.equal(after.data.sessions.length, 1, "only the original session survives");
+  assert.ok(await after.auth(token));
+});
+
+test("an oversized upload does not disturb a concurrent valid upload", async () => {
+  const a = await makeAccount("racer-a@example.com");
+  const b = await makeAccount("racer-b@example.com");
+
+  // A pushes past the 16 KB cap mid-flight, while B is still streaming
+  const oversized = new Promise((resolve, reject) => {
+    const req = http.request(base + "/api/clips", {
+      method: "POST",
+      headers: { "content-type": "video/webm", authorization: `Bearer ${a.token}` }
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+    });
+    req.on("error", reject);
+    req.write(Buffer.alloc(12 * 1024));
+    // B starts and finishes entirely inside A's pause
+    setTimeout(() => {
+      req.write(Buffer.alloc(12 * 1024));
+      req.end();
+    }, 150);
+  });
+
+  await new Promise((r) => setTimeout(r, 30));
+  const valid = await uploadClip(b.token, { bytes: 8192, durationMs: 1000 });
+
+  const failed = await oversized;
+  assert.equal(failed.status, 413, "the oversized upload is refused");
+  assert.equal(valid.res.status, 201, "the concurrent valid upload survives");
+  assert.equal((await request("GET", `/api/clips/${valid.clip.id}/file`)).status, 200,
+    "the valid clip's file is intact afterwards");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "tmp")), [],
+    "no staging files are left behind");
+  await request("DELETE", `/api/clips/${valid.clip.id}`, {
+    headers: { authorization: `Bearer ${valid.clip.manageToken}` }
+  });
+});
+
 // --- hardening kept from step 1 --------------------------------------------
 
 test("unknown ids answer 404 everywhere", async () => {
@@ -546,27 +998,356 @@ test("store rejects invalid ids and survives a fresh init", async () => {
   await store.init(); // idempotent
 });
 
+// --- round 5: every stored clip is verified, whatever it was labelled ------
+
+test("an upload whose blocks precede an over-cap Cluster Timestamp is refused", async () => {
+  const { token } = await makeAccount("latebase@example.com");
+  const webm = Buffer.concat([
+    rawWebmHead(), CLUSTER_UNKNOWN, simpleBlock(0), clusterTimestamp(600000), simpleBlock(0)
+  ]);
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+
+  // the same ordering within the cap is measured from the late Timestamp,
+  // not read as a near-zero clip
+  const ok = Buffer.concat([
+    rawWebmHead(), CLUSTER_UNKNOWN, simpleBlock(0), clusterTimestamp(1000), simpleBlock(500)
+  ]);
+  const good = await request("POST", "/api/clips", {
+    body: ok,
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(good.status, 201);
+  const clip = JSON.parse(good.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 2000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("an over-cap MP4 is refused — no format escapes the duration check", async () => {
+  const { token } = await makeAccount("mp4cap@example.com");
+  const ftyp = Buffer.from([
+    0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, // size + "ftyp"
+    0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 1, // "isom", minor version
+    0x69, 0x73, 0x6f, 0x6d, 0x6d, 0x70, 0x34, 0x31 // compatible brands
+  ]);
+  const mdat = Buffer.concat([Buffer.from([0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74]), crypto.randomBytes(1024)]);
+  const res = await request("POST", "/api/clips", {
+    body: Buffer.concat([ftyp, mdat]),
+    headers: {
+      "content-type": "video/mp4",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /verif/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+});
+
+test("a webm relabeled as another format is still verified, and stored as a webm", async () => {
+  const { token } = await makeAccount("relabel@example.com");
+  // 40 s of real timeline under a video/mp4 label and a lying declared header
+  const res = await request("POST", "/api/clips", {
+    body: minimalWebm(40000, { declaredMs: 1000 }),
+    headers: {
+      "content-type": "video/mp4",
+      "x-duration-ms": "1000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 413);
+  assert.match(JSON.parse(res.body).error, /40|minute/i);
+  assert.deepEqual(fs.readdirSync(path.join(process.env.DATA_DIR, "clips")), []);
+
+  // a within-cap webm under the same label is accepted — and the file, not
+  // the request, decides its content type and filename
+  const ok = await request("POST", "/api/clips", {
+    body: minimalWebm(8000),
+    headers: { "content-type": "video/mp4", authorization: `Bearer ${token}` }
+  });
+  assert.equal(ok.status, 201);
+  const clip = JSON.parse(ok.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.contentType, "video/webm");
+  assert.equal(meta.filename, "recording.webm");
+  const file = await request("GET", `/api/clips/${clip.id}/file`);
+  assert.equal(file.headers["content-type"], "video/webm");
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("a matroska upload is labelled from its own DocType", async () => {
+  const { token } = await makeAccount("mkvlabel@example.com");
+  const mkv = Buffer.concat([
+    // EBML header with DocType "matroska"
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x8b, 0x42, 0x82, 0x88,
+      0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x87, 0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40]),
+    CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(8000)
+  ]);
+  const res = await request("POST", "/api/clips", {
+    body: mkv,
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(res.status, 201);
+  const clip = JSON.parse(res.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.contentType, "video/matroska");
+  assert.equal(meta.filename, "recording.mkv");
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+// --- round 5: the recorder's Duration patch, exercised verbatim -------------
+
+// A MediaRecorder-shaped webm whose Info body is padded with a Void so the
+// patched Info body lands exactly on targetBodyLen bytes — the sizes where
+// the size vint changes width.
+function patchFixture(targetBodyLen, durationMs = 4000) {
+  const parts = [];
+  parts.push(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
+  parts.push(Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+  const scale = Buffer.from([0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40]);
+  const voidTotal = targetBodyLen - scale.length - 11; // the Duration element the patch adds
+  assert.ok(voidTotal >= 2, "fixture target leaves room for a Void");
+  let n = 1;
+  while (voidTotal - 1 - n > Math.pow(2, 7 * n) - 2) n++;
+  const voidBody = voidTotal - 1 - n;
+  const infoBody = Buffer.concat([scale, Buffer.from([0xec]), sizeVint(voidBody), Buffer.alloc(voidBody)]);
+  parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66]), sizeVint(infoBody.length), infoBody);
+  parts.push(CLUSTER_UNKNOWN, clusterTimestamp(0), simpleBlock(durationMs));
+  return Buffer.concat(parts);
+}
+
+test("webmSizeVint marks each width with its own marker bit", () => {
+  const cases = [
+    [0, [0x80]],
+    [126, [0xfe]],
+    [127, [0x40, 0x7f]], // the width grows one byte before all-ones could mean "unknown"
+    [128, [0x40, 0x80]], // the old encoder wrote 0x80 0x80 here: a zero-length element
+    [16382, [0x7f, 0xfe]],
+    [16383, [0x20, 0x3f, 0xff]],
+    [16384, [0x20, 0x40, 0x00]],
+    [2 ** 21 - 2, [0x3f, 0xff, 0xfe]]
+  ];
+  for (const [value, expected] of cases) {
+    assert.deepEqual(Array.from(webmPatch.webmSizeVint(value)), expected, `size ${value}`);
+  }
+  // round trip through the same reading the server's scanner uses
+  for (const value of [0, 1, 126, 127, 128, 16382, 16383, 16384, 2 ** 21 - 2, 2 ** 28]) {
+    const out = webmPatch.webmSizeVint(value);
+    let len = 1;
+    for (let mask = 0x80; !(out[0] & mask); mask >>= 1) len++;
+    let decoded = out[0] & (0xff >> len);
+    for (let i = 1; i < out.length; i++) decoded = decoded * 256 + out[i];
+    assert.equal(decoded, value, `round trip ${value}`);
+  }
+  assert.throws(() => webmPatch.webmSizeVint(2 ** 56 - 1), RangeError);
+  assert.throws(() => webmPatch.webmSizeVint(-1), RangeError);
+});
+
+test("the recorder's patch keeps the file verifiable at every size-vint width", async () => {
+  for (const target of [126, 127, 128, 16382, 16383, 16384]) {
+    const original = patchFixture(target);
+    assert.equal(readWebmDurationMs(original), 4000, `fixture ${target} parses`);
+    const patched = await webmPatch.patchWebmDuration(new Blob([original]), 4000);
+    assert.ok(patched, `patch ${target} applied`);
+    const bytes = Buffer.from(await patched.arrayBuffer());
+    // the rebuilt Info's size vint carries the marker of its own width
+    const infoVintAt = 12 + 12 + 4; // EBML header + Segment header + the Info id
+    let len = 1;
+    for (let mask = 0x80; !(bytes[infoVintAt] & mask); mask >>= 1) len++;
+    assert.equal(len, target <= 126 ? 1 : target <= 16382 ? 2 : 3, `width ${target}`);
+    let decoded = bytes[infoVintAt] & (0xff >> len);
+    for (let i = 1; i < len; i++) decoded = decoded * 256 + bytes[infoVintAt + i];
+    assert.equal(decoded, target, `declared Info body ${target}`);
+    // the media timeline survives the rebuild byte-for-byte elsewhere
+    assert.equal(readWebmDurationMs(bytes), 4000, `patched ${target} still scans`);
+  }
+});
+
+test("a patched recording uploads cleanly — the old encoder's corrupting size is gone", async () => {
+  const { token } = await makeAccount("patched@example.com");
+  // 128 was the exact body size the old encoder corrupted: 0x80 0x80
+  const patched = await webmPatch.patchWebmDuration(new Blob([patchFixture(128)]), 4000);
+  const bytes = Buffer.from(await patched.arrayBuffer());
+  const res = await request("POST", "/api/clips", {
+    body: bytes,
+    headers: { "content-type": "video/webm", authorization: `Bearer ${token}` }
+  });
+  assert.equal(res.status, 201);
+  const clip = JSON.parse(res.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 4000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("the patch script the recorder loads is served and wired in", async () => {
+  const res = await request("GET", "/webm-patch.js");
+  assert.equal(res.status, 200);
+  assert.match(res.headers["content-type"], /text\/javascript/);
+  assert.match(res.body.toString(), /OpenLoomWebmPatch/);
+  const page = await request("GET", "/");
+  assert.match(page.body.toString(), /<script src="\/webm-patch\.js"><\/script>/);
+  // one definition now: the inline copies are gone from the page
+  assert.ok(!page.body.toString().includes("function webmSizeVint"));
+  assert.ok(!page.body.toString().includes("function patchWebmDuration"));
+});
+
 // --- helpers ---------------------------------------------------------------
 
 // A minimal but structurally honest webm: EBML header, Segment of unknown
-// size, Info with TimestampScale and Duration, then a Cluster of unknown size.
-function minimalWebm(durationMs) {
+// size, Info with TimestampScale and (optionally) Duration, then Clusters of
+// unknown size — each with a Timestamp and one SimpleBlock — so the file
+// carries a real media timeline the way MediaRecorder output does.
+function minimalWebm(durationMs, { declaredMs = null, omitDuration = false } = {}) {
+  return webmFile({
+    spans: spansFor(durationMs),
+    declaredDurationMs: omitDuration ? null : (declaredMs ?? durationMs)
+  });
+}
+
+// A webm padded to at least `padTo` bytes with a Void element, handy when a
+// test needs a payload of a particular size.
+function webmPayload(padTo, timelineMs, { noTimeline = false } = {}) {
+  return webmFile({
+    spans: noTimeline ? [] : spansFor(timelineMs),
+    declaredDurationMs: null,
+    padTo
+  });
+}
+
+// Absolute timestamps over 32767 ms do not fit a block's signed 16-bit
+// timecode, so the overflow moves into the Cluster's own Timestamp.
+function spansFor(absMs) {
+  if (absMs <= 32767) return [[0, absMs]];
+  return [[32768, absMs - 32768]];
+}
+
+function webmFile({ spans = [], declaredDurationMs = null, padTo = 0, tracks = [], blockGroups = [], laced = [] } = {}) {
   const parts = [];
   // EBML header: DocType "webm"
   parts.push(Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]));
   // Segment, unknown size (what MediaRecorder emits for live recordings)
   parts.push(Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
-  // Info, known size 17: TimestampScale (1e6) + Duration (double)
-  const infoBody = Buffer.concat([
-    Buffer.from([0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40]),
-    Buffer.from([0x44, 0x89, 0x88]),
-    (() => { const b = Buffer.alloc(8); b.writeDoubleBE(durationMs, 0); return b; })()
-  ]);
+  // Info: TimestampScale (1e6) plus, when wanted, a Duration double
+  const infoParts = [Buffer.from([0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40])];
+  if (declaredDurationMs !== null) {
+    infoParts.push(Buffer.from([0x44, 0x89, 0x88]));
+    const d = Buffer.alloc(8);
+    d.writeDoubleBE(declaredDurationMs, 0);
+    infoParts.push(d);
+  }
+  const infoBody = Buffer.concat(infoParts);
   parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x80 | infoBody.length]), infoBody);
-  // Cluster, unknown size, with a little payload
-  parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
-  parts.push(Buffer.from([0xa3, 0x84, 0x01, 0x02, 0x03, 0x04])); // a SimpleBlock-ish blob
-  return Buffer.concat(parts);
+  // Tracks: a TrackEntry per {trackNumber, defaultNs}, as a real muxer writes it
+  if (tracks.length) {
+    const entries = tracks.map(({ trackNumber, defaultNs, extraElements = [] }) => {
+      const durSize = uintBodySize(defaultNs);
+      const durBody = Buffer.alloc(durSize);
+      let v = defaultNs;
+      for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+      const entryBody = Buffer.concat([
+        Buffer.from([0xd7, 0x81, trackNumber]), // TrackNumber, one byte
+        ...extraElements,
+        Buffer.from([0x23, 0xe3, 0x83, 0x80 | durBody.length]), durBody // DefaultDuration
+      ]);
+      return Buffer.concat([Buffer.from([0xae, 0x80 | entryBody.length]), entryBody]);
+    });
+    const tracksBody = Buffer.concat(entries);
+    parts.push(Buffer.from([0x16, 0x54, 0xae, 0x6b, 0x80 | tracksBody.length]), tracksBody);
+  }
+  for (const [clusterMs, relMs] of spans) {
+    parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const ts = Buffer.alloc(4);
+    ts.writeUInt32BE(clusterMs, 0);
+    parts.push(Buffer.from([0xe7, 0x84]), ts);
+    const blockBody = Buffer.concat([
+      Buffer.from([0x81]), // track number 1
+      (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+      Buffer.from([0x00, 0x00]) // flags and a first payload byte
+    ]);
+    parts.push(Buffer.from([0xa3, 0x80 | blockBody.length]), blockBody);
+  }
+  // laced SimpleBlocks: {clusterMs, relMs, frames} — Xiph-style lacing flag,
+  // a frame-count byte, one (zero-length) size byte per extra frame
+  for (const { clusterMs, relMs, frames } of laced) {
+    parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const ts = Buffer.alloc(4);
+    ts.writeUInt32BE(clusterMs, 0);
+    parts.push(Buffer.from([0xe7, 0x84]), ts);
+    const blockBody = Buffer.concat([
+      Buffer.from([0x81]), // track number 1
+      (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+      Buffer.from([0x02]), // lacing: Xiph
+      Buffer.from([frames - 1]), // frame count - 1
+      Buffer.alloc(frames - 1, 0), // Xiph sizes: zero-length first frames
+      Buffer.from([0x00]) // a payload byte for the last frame
+    ]);
+    parts.push(Buffer.from([0xa3, 0x80 | blockBody.length]), blockBody);
+  }
+  // BlockGroups: {clusterMs, relMs, blockDuration} — a Block plus its
+  // explicit BlockDuration, as the spec puts them
+  for (const { clusterMs, relMs, blockDuration } of blockGroups) {
+    parts.push(Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    const ts = Buffer.alloc(4);
+    ts.writeUInt32BE(clusterMs, 0);
+    parts.push(Buffer.from([0xe7, 0x84]), ts);
+    const blockBody = Buffer.concat([
+      Buffer.from([0x81]), // track number 1
+      (() => { const b = Buffer.alloc(2); b.writeInt16BE(relMs, 0); return b; })(),
+      Buffer.from([0x00, 0x00]) // flags and a first payload byte
+    ]);
+    const durSize = uintBodySize(blockDuration);
+    const durBody = Buffer.alloc(durSize);
+    let v = blockDuration;
+    for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+    const groupBody = Buffer.concat([
+      Buffer.from([0xa1, 0x80 | blockBody.length]), blockBody,
+      Buffer.from([0x9b, 0x80 | durBody.length]), durBody
+    ]);
+    parts.push(Buffer.from([0xa0, 0x80 | groupBody.length]), groupBody);
+  }
+  const base = Buffer.concat(parts);
+  const need = padTo - base.length;
+  if (need >= 2) {
+    // Void: the one element every matroska reader must skip harmlessly
+    let n = 1;
+    while (need - 1 - n > Math.pow(2, 7 * n) - 2) n++;
+    const size = need - 1 - n;
+    return Buffer.concat([base, Buffer.from([0xec]), sizeVint(size), Buffer.alloc(size)]);
+  }
+  return base;
+}
+
+// how many body bytes an unsigned integer needs (1–8, EBML style)
+function uintBodySize(value) {
+  let n = 1;
+  while (value >= Math.pow(2, 8 * n)) n++;
+  return n;
+}
+
+// An EBML size vint: marker bit plus the value in the remaining bits.
+function sizeVint(value) {
+  let n = 1;
+  while (value > Math.pow(2, 7 * n) - 2) n++;
+  const buf = Buffer.alloc(n);
+  let v = value;
+  for (let i = n - 1; i > 0; i--) {
+    buf[i] = v & 0xff;
+    v = Math.floor(v / 256);
+  }
+  buf[0] = (v & (0xff >> (n - 1))) | (0x80 >> (n - 1));
+  return buf;
 }
 
 // --- payments: unit level ---------------------------------------------------
@@ -787,8 +1568,6 @@ test("billing routes need an account", async () => {
 // writes used to let overlapping operations corrupt accounts.json and
 // invoices.json, and a rejected upload used to delete every other upload's
 // staging file with the shared tmp directory.
-
-const { Accounts } = require("../lib/accounts");
 
 test("concurrent account operations persist one consistent store", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-conc-"));
@@ -1573,8 +2352,10 @@ function gatedUpload(payload, token) {
 test("empty, aborted and oversized uploads cannot disturb a concurrent save", async () => {
   const account = await makeAccount("concurrent-save@example.com");
   const clipsBefore = fs.readdirSync(path.join(process.env.DATA_DIR, "clips")).length;
-  // below the free clip cap (16 KB here) but past the gated first burst
-  const payload = crypto.randomBytes(12 * 1024);
+  // below the free clip cap (16 KB here) but past the gated first burst; a
+  // real webm timeline, since the server verifies every upload's duration
+  // from the file itself and refuses anything it cannot verify
+  const payload = webmPayload(12 * 1024, 3000);
   const good = gatedUpload(payload, account.token);
   await sleep(100); // its staging file now exists on the server
 
@@ -1670,7 +2451,9 @@ test("clips survive a fresh server generation on the same data directory", async
   // the stand-in for a container replacement: a brand-new store opening the
   // same data dir must serve the same bytes and honour the same manage key
   const account = await makeAccount("restart-survivor@example.com");
-  const payload = crypto.randomBytes(1024);
+  // a real webm timeline: the server verifies every upload's duration from
+  // the file itself and refuses anything it cannot verify
+  const payload = webmPayload(1024, 2000);
   const create = await request("POST", "/api/clips", {
     body: payload,
     headers: {

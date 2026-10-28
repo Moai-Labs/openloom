@@ -10,7 +10,7 @@ const crypto = require("node:crypto");
 const { Store, UploadTooLarge } = require("./lib/store");
 const { Accounts } = require("./lib/accounts");
 const { createTar } = require("./lib/tar");
-const { readWebmDurationMs } = require("./lib/webm-duration");
+const { scanWebmDurationFile, readWebmDocType } = require("./lib/webm-duration");
 const payments = require("./lib/payments");
 
 const port = Number(process.env.PORT ?? 3000); // 0 is allowed: tests pick an ephemeral port
@@ -203,33 +203,44 @@ async function createClip(req, res) {
         accountId: account.id
     });
 
-    // Verify the duration from the file itself when it is a webm: a header
-    // the client controls is not an enforcement point.
-    if (contentType.includes("webm") || contentType.includes("matroska")) {
-        try {
-            const head = Buffer.alloc(Math.min(1024 * 1024, meta.bytes));
-            const file = await fs.promises.open(store.videoPath(meta.id), "r");
-            try {
-                const { bytesRead } = await file.read(head, 0, head.length, 0);
-                const parsed = readWebmDurationMs(head.subarray(0, bytesRead));
-                if (parsed !== null) {
-                    if (parsed > plan.maxDurationMs + 2000) { // small encoder slop
-                        await store.remove(meta.id, { token: manageToken });
-                        sendError(res, 413, `${tierName} stores clips up to ${Math.round(plan.maxDurationMs / 60000)} minutes — this one runs ${Math.round(parsed / 60000)}`);
-                        return;
-                    }
-                    if (meta.durationMs === null) {
-                        meta.durationMs = parsed;
-                        await store.updateMeta(meta);
-                    }
-                }
-            } finally {
-                await file.close();
-            }
-        } catch {
-            // unreadable duration falls back to the declared one
-        }
+    // The duration is verified from the file's own media timeline — the
+    // cluster/block timestamps, not the Info.Duration float, which is
+    // client-writable text and no enforcement point — for every stored
+    // clip, whatever Content-Type the request claimed: that header is
+    // client-written too, and relabeling an upload must not choose which
+    // files get verified. The scanner reads webm/matroska; anything else —
+    // an MP4, a text body under a video/ header — has no verifiable
+    // timeline and is refused: the cap is only as strong as the
+    // verification behind it, so verification failing closes the door.
+    let verified = null;
+    try {
+        verified = await scanWebmDurationFile(store.videoPath(meta.id));
+    } catch {
+        verified = null; // unreadable file: the same fail-closed path
     }
+    if (verified === null) {
+        await store.remove(meta.id, { token: manageToken });
+        sendError(res, 413, "the recording's length could not be verified from the file itself, so the free plan cannot store it");
+        return;
+    }
+    if (verified > plan.maxDurationMs + 2000) { // small encoder slop
+        await store.remove(meta.id, { token: manageToken });
+        sendError(res, 413, `${tierName} stores clips up to ${Math.round(plan.maxDurationMs / 60000)} minutes — this one runs ${Math.round(verified / 60000)}`);
+        return;
+    }
+    // the timeline is the truth, even when the declared header disagrees
+    meta.durationMs = verified;
+    // and the file, not the request, says what it is — a webm sent as
+    // video/mp4 is stored and served as a webm
+    const docType = readWebmDocType(store.videoPath(meta.id));
+    const fileType = docType !== null && docType.includes("matroska")
+        ? "video/matroska"
+        : "video/webm";
+    if (meta.contentType !== fileType) {
+        meta.contentType = fileType;
+        meta.filename = safeFilename(meta.title, fileType);
+    }
+    await store.updateMeta(meta);
 
     // Recount after the write: two concurrent uploads must not sneak past the cap.
     const after = await store.listByAccount(account.id);
@@ -834,7 +845,12 @@ server.on("clientError", (err, socket) => {
     loadPage("watch.html", "text/html; charset=utf-8");
     loadPage("limits.html", "text/html; charset=utf-8");
     loadPage("upgrade.html", "text/html; charset=utf-8");
-    loadStatic("/vendor/fix-webm-duration.js", "fix-webm-duration.js", "application/javascript; charset=utf-8");
+    // the recorder's webm Duration patch, shared verbatim with the tests —
+    // the vendor fix-webm-duration script is gone on this branch
+    staticFiles.set("/webm-patch.js", {
+        file: path.join(__dirname, "lib", "webm-patch.js"),
+        type: "text/javascript; charset=utf-8"
+    });
     server.listen(port, () => console.log(`listening on ${server.address().port} — data in ${dataDir}`));
 })().catch((err) => {
     console.error("failed to start:", err);

@@ -185,18 +185,23 @@
 
   <section class="card hidden" id="deviceCard">
     <h1 style="font-size:1.1rem">Recorded on this device</h1>
-    <p class="sub">Made before you signed in on this browser — saved in this browser only.</p>
+    <p class="sub">Made in this browser without an account, before OpenLoom accounts existed — kept on this device only.</p>
     <ul class="recordings" id="deviceList"></ul>
     <p class="empty" id="deviceEmpty">Nothing here.</p>
   </section>
 </main>
 <footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. Paid plan: $10/month for 2 GB via test USDC. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
 
-<script src="/vendor/fix-webm-duration.js"></script>
+<!-- the webm Duration patch, shared verbatim with the server's tests -->
+<script src="/webm-patch.js"></script>
 <script>
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+// The old global key holds only recordings made without an account (from the
+// first build, before accounts existed). Everything recorded since is cached
+// under a key scoped to the account that made it, so signing out — or signing
+// in as somebody else — never exposes another creator's clips or keys.
 const STORE_KEY = "openloom.recordings";
 const TOKEN_KEY = "openloom.token";
 const EMAIL_KEY = "openloom.email";
@@ -225,8 +230,23 @@ let starting = false;       // a start attempt is between click and success/fail
 let pendingBlob = null;
 let pendingDurationMs = 0;
 let pendingTitle = "";
-let uploadXhr = null;
+// the account that started the recording — every later decision about this
+// blob (which cache it lands in, who sees its links) uses this, never
+// whatever account happens to be signed in when a response arrives
+let pendingOwnerEmail = null;
+// Identity of the save attempt that owns the pending state and the page.
+// Each saveRecording() run captures its own op object at entry, and every
+// callback checks it against `saveOp` before touching anything shared. A
+// newer attempt (a successor's recording, a retry) or a torn-down account
+// sets saveOp aside, and an older attempt's progress, completion and
+// failure callbacks then drop their result instead of clearing or
+// overwriting whatever the newer operation owns now.
+let saveOp = null;
 let autoStopped = false;
+// set while a sign-out or account switch tears a recording down: the
+// recorder's onstop then discards quietly instead of painting over the
+// departure message
+let droppingRecording = false;
 
 // --- tiny helpers ---------------------------------------------------------
 
@@ -243,11 +263,39 @@ function storageRemove(key) {
 function token() { return storage(TOKEN_KEY, null); }
 function signedIn() { return !!token(); }
 
-function loadRecordings() {
+function accountRecordingsKey(email) {
+  return STORE_KEY + ":" + email;
+}
+
+// Recordings made without an account, cached under the original global key.
+function loadLegacyRecordings() {
   try { return JSON.parse(storage(STORE_KEY, "[]")) || []; } catch { return []; }
 }
-function saveRecordings(list) {
+function saveLegacyRecordings(list) {
   storageSet(STORE_KEY, JSON.stringify(list.slice(0, 50)));
+}
+
+// The offline manage-key cache of the account that is signed in. Keyed by the
+// account, rendered only while that account is authenticated on this browser.
+// Both forms take the account explicitly: code holding a captured owner never
+// goes through whichever email happens to be signed in now.
+function loadRecordingsFor(email) {
+  if (!email) return [];
+  try { return JSON.parse(storage(accountRecordingsKey(email), "[]")) || []; } catch { return []; }
+}
+function saveRecordingsFor(email, list) {
+  if (!email) return;
+  storageSet(accountRecordingsKey(email), JSON.stringify(list.slice(0, 50)));
+}
+function loadAccountRecordings() {
+  return loadRecordingsFor(storage(EMAIL_KEY, null));
+}
+function saveAccountRecordings(list) {
+  saveRecordingsFor(storage(EMAIL_KEY, null), list);
+}
+function removeAccountRecordings() {
+  const email = storage(EMAIL_KEY, null);
+  if (email) storageRemove(accountRecordingsKey(email));
 }
 
 function fmtBytes(n) {
@@ -280,25 +328,77 @@ function pickMime() {
 
 // --- account --------------------------------------------------------------
 
+// A response that arrives after the session it was made under has ended must
+// not paint one account's state onto another's page.
+function sessionChanged(tokenAtStart) {
+  return token() !== tokenAtStart;
+}
+
+// Clears the pending recording's fields — but only for the save attempt
+// that still owns them. A late callback of a superseded attempt passes its
+// own op, no longer matches, and clears nothing: the pending blob, title
+// and owner on the page belong to whoever recorded last.
+function discardPendingRecording(op) {
+  if (saveOp !== op) return;
+  pendingBlob = null;
+  pendingDurationMs = 0;
+  pendingTitle = "";
+  pendingOwnerEmail = null;
+  saveOp = null;
+}
+
+// Everything on the page that belongs to the departing account: its result
+// links, its pending recording, its preview. Pending save callbacks of the
+// departing attempt have nothing left to restore or submit afterwards —
+// dropping saveOp makes every one of them stale.
+function clearDepartedAccountState() {
+  saveOp = null;
+  pendingBlob = null;
+  pendingDurationMs = 0;
+  pendingTitle = "";
+  pendingOwnerEmail = null;
+  $("shareLink").value = "";
+  $("manageLink").value = "";
+  $("openShare").href = "#";
+  $("resultNote").textContent = "";
+  clearInterval(timerHandle);
+  if (recorder) {
+    droppingRecording = true;
+    try { recorder.stop(); } catch { /* already stopping */ }
+    recorder = null;
+  }
+  chunks = [];
+  stopAllTracks();
+  $("preview").srcObject = null;
+  $("preview").classList.add("hidden");
+  show("setup");
+}
+
 async function refreshAccount() {
-  const signed = signedIn();
+  const requestToken = token();
+  const signed = !!requestToken;
   $("signInLink").classList.toggle("hidden", signed);
   $("signOutLink").classList.toggle("hidden", !signed);
   $("auth").classList.toggle("hidden", signed || authCardPinned);
   $("clipsCard").classList.toggle("hidden", !signed);
-  $("deviceCard").classList.toggle("hidden", signed || loadRecordings().length === 0);
+  // genuine no-account recordings from this device, visible signed in or not
+  $("deviceCard").classList.toggle("hidden", loadLegacyRecordings().length === 0);
   $("whoami").classList.toggle("hidden", !signed);
   if (signed) {
     $("whoami").textContent = storage(EMAIL_KEY, "");
     $("authStatus").textContent = "";
     try {
-      const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+      const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + requestToken } });
+      // the session may have been signed out while the request was in flight
+      if (sessionChanged(requestToken)) return;
       if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
       const data = await res.json();
+      if (sessionChanged(requestToken)) return;
       renderUsage(data.usage, data.limits);
       if (data.limits) limits = data.limits;
       await renderServerClips();
     } catch {
+      if (sessionChanged(requestToken)) return;
       renderUsage(null, null);
     }
   } else {
@@ -332,6 +432,7 @@ function renderUsage(usage, serverLimits) {
 async function submitAuth(mode) {
   const email = $("email").value.trim();
   const password = $("password").value;
+  const previousEmail = storage(EMAIL_KEY, null);
   try {
     const res = await fetch(mode === "signup" ? "/api/accounts" : "/api/sessions", {
       method: "POST",
@@ -340,10 +441,13 @@ async function submitAuth(mode) {
     });
     const data = await res.json().catch(() => ({}));
     if (res.status === 200 || res.status === 201) {
+      const switcher = previousEmail !== null && previousEmail !== data.email;
       storageSet(TOKEN_KEY, data.token);
       storageSet(EMAIL_KEY, data.email);
       authCardPinned = false;
       $("password").value = "";
+      if (switcher) clearDepartedAccountState(); // the previous account's links and pending recording leave with it
+      clearServerList(); // an account switch never shows the previous account's rows
       setStatus("setupStatus", "Signed in as " + data.email + ". You can record.", "ok");
       await refreshAccount();
     } else {
@@ -359,8 +463,16 @@ function signOut(message) {
   if (t) fetch("/api/sessions/current", { method: "DELETE", headers: { Authorization: "Bearer " + t } }).catch(() => {});
   storageRemove(TOKEN_KEY);
   storageRemove(EMAIL_KEY);
+  clearDepartedAccountState(); // result links, pending recording and preview leave with the account
+  clearServerList(); // the departing account's clips leave the page at once
   if (message) setStatus("setupStatus", message, "error");
   refreshAccount();
+}
+
+// Empties the rendered account list without touching any cache on disk.
+function clearServerList() {
+  $("recList").textContent = "";
+  $("recEmpty").classList.remove("hidden");
 }
 
 // --- recording ------------------------------------------------------------
@@ -497,6 +609,10 @@ async function startRecording() {
   recordStart = performance.now();
   starting = false;
   autoStopped = false;
+  // a new recording supersedes any save still in flight: its callbacks must
+  // not clear or overwrite this one's pending state
+  saveOp = null;
+  pendingOwnerEmail = storage(EMAIL_KEY, null); // the account this recording belongs to
 
   show("recording");
   $("timer").textContent = "0:00";
@@ -520,10 +636,13 @@ async function startRecording() {
 
 // The server enforces the cap too; this saves a wasted recording.
 async function overClipLimit() {
+  const requestToken = token();
+  if (!requestToken) return false;
   try {
-    const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
-    if (!res.ok) return false;
+    const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + requestToken } });
+    if (!res.ok || sessionChanged(requestToken)) return false;
     const data = await res.json();
+    if (sessionChanged(requestToken)) return false;
     if (data.limits) limits = data.limits;
     renderUsage(data.usage, data.limits);
     return data.usage && data.usage.clips >= limits.maxClips;
@@ -594,6 +713,12 @@ function finalizeRecording() {
   // usable again on every path out of here — success, failure, empty.
   $("startBtn").disabled = false;
 
+  if (droppingRecording) { // torn down by a sign-out or account switch
+    droppingRecording = false;
+    chunks = [];
+    return;
+  }
+
   if (err) {
     chunks = [];
     show("setup");
@@ -613,40 +738,93 @@ function finalizeRecording() {
 
 // --- saving ----------------------------------------------------------------
 
+// The webm Duration patch lives in /webm-patch.js, shared verbatim with the
+// server's tests: a patch the tests accept is the patch recordings get. The
+// library declares patchWebmDuration at the top level, so the page reaches
+// for it through its OpenLoomWebmPatch binding instead of a local const —
+// redeclaring the name here would kill this whole script.
+
 async function saveRecording() {
-  let blob = pendingBlob;
+  const blob = pendingBlob;
+  if (!blob) return; // nothing pending: a retry after a discard or sign-out
+  // This attempt's own identity and captured state. Everything a callback
+  // needs comes from these locals — the shared pending fields belong to
+  // whichever save is current when the callback runs, which may be a
+  // successor's, not this one's.
+  const op = {};
+  saveOp = op;
+  const stale = () => saveOp !== op;
   const durationMs = Math.max(0, Math.round(pendingDurationMs));
+  // The account that started this recording — not whichever one is signed in
+  // when the response lands. An upload must never be submitted under, cached
+  // for, or shown to a different account than the one that made it.
+  const ownerEmail = pendingOwnerEmail ?? storage(EMAIL_KEY, null);
+  const ownerToken = storage(TOKEN_KEY, null);
+  const ownerTitle = pendingTitle;
+  if (!ownerEmail || !ownerToken) {
+    clearDepartedAccountState();
+    setStatus("setupStatus", "You are signed out — the recording cannot be saved. Record again after signing in.", "error");
+    return;
+  }
 
   // MediaRecorder webm files carry no duration; patch it in so players and
   // seeking behave. On any failure the original blob is uploaded as-is.
-  if (blob.type.includes("webm") && durationMs > 0 && typeof window.ysFixWebmDuration === "function") {
+  let patched = blob;
+  if (patched.type.includes("webm") && durationMs > 0) {
     try {
-      blob = await Promise.race([
-        window.ysFixWebmDuration(blob, durationMs),
-        new Promise((resolve) => setTimeout(() => resolve(blob), 5000))
-      ]);
+      patched = (await Promise.race([
+        self.OpenLoomWebmPatch.patchWebmDuration(patched, durationMs),
+        new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+      ])) || patched;
     } catch { /* keep the unpatched blob */ }
   }
-  pendingBlob = blob;
+  // the patch ran across an await: while it ran, a successor may have
+  // started recording, retried, or the account may have been signed out.
+  // The patched blob is stored only if this attempt still owns the page.
+  if (stale()) return;
 
+  // an account switch while the (patching, upload) work was pending must not
+  // submit the recording under the successor's session
+  if (storage(EMAIL_KEY, null) !== ownerEmail) {
+    discardPendingRecording(op); // never the successor's state — only this attempt's fields
+    setStatus("setupStatus", "The account changed since this recording was made — it was not submitted. Sign in as " + ownerEmail + " to save it.", "error");
+    return;
+  }
+
+  pendingBlob = patched;
   show("saving");
   setProgress(0);
 
   const xhr = new XMLHttpRequest();
-  uploadXhr = xhr;
   xhr.open("POST", "/api/clips");
-  xhr.setRequestHeader("Content-Type", blob.type || "video/webm");
-  xhr.setRequestHeader("X-Title", encodeURIComponent(pendingTitle));
+  xhr.setRequestHeader("Content-Type", patched.type || "video/webm");
+  xhr.setRequestHeader("X-Title", encodeURIComponent(ownerTitle));
   xhr.setRequestHeader("X-Duration-Ms", String(durationMs));
-  xhr.setRequestHeader("Authorization", "Bearer " + token());
+  xhr.setRequestHeader("Authorization", "Bearer " + ownerToken);
   xhr.responseType = "json";
 
-  xhr.upload.onprogress = (e) => { if (e.lengthComputable) setProgress(e.loaded / e.total); };
+  xhr.upload.onprogress = (e) => {
+    if (!stale() && e.lengthComputable) setProgress(e.loaded / e.total);
+  };
   xhr.onload = () => {
-    uploadXhr = null;
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
+      // the clip exists and its key belongs in the owner's cache, whatever
+      // happened on the page since the upload was sent
+      rememberLocally(xhr.response, ownerEmail, ownerTitle);
+    }
+    if (stale()) return; // a newer attempt owns the page now: touch nothing of its
+    // the response may arrive under a different account than the one that
+    // submitted it: its links and key belong to the owner only
+    const ownerChanged = storage(EMAIL_KEY, null) !== ownerEmail;
     if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
       const data = xhr.response;
-      rememberLocally(data);
+      if (ownerChanged) {
+        // the departure already cleaned up after itself; the successor's page
+        // (an active recording included) must not be torn down by this callback
+        discardPendingRecording(op);
+        setStatus("setupStatus", "The recording was saved to " + ownerEmail + " — you have changed accounts since, so its links are not shown here.", "");
+        return;
+      }
       renderServerClips();
 
       const url = new URL(location.href);
@@ -656,11 +834,17 @@ async function saveRecording() {
       $("openShare").href = data.sharePath;
       $("resultNote").textContent = "Saved — " + fmtBytes(data.bytes) + " is now shareable.";
       show("result");
+    } else if (ownerChanged) {
+      // a failed response for the departed account never touches the new one
+      discardPendingRecording(op);
+      setStatus("setupStatus", "The save for " + ownerEmail + " did not go through, and you have changed accounts since. Sign in as " + ownerEmail + " to try again.", "error");
     } else {
       const detail = xhr.response && xhr.response.error ? " (" + xhr.response.error + ")" : "";
       if (xhr.status === 401) {
         showSaveFailure("Your session expired — sign in again to save. " + detail);
-        signOut();
+        // a 401 for a session that has already ended must not sign out the
+        // session that is signed in now
+        if (storage(TOKEN_KEY, null) === ownerToken) signOut();
       } else if (xhr.status === 403 || xhr.status === 413) {
         showSaveFailure("Nothing was saved. " + (xhr.response && xhr.response.error ? xhr.response.error : "The save was refused.") + " Your recording is still here — download a copy or delete a clip and retry.");
       } else {
@@ -669,23 +853,26 @@ async function saveRecording() {
     }
   };
   xhr.onerror = () => {
-    uploadXhr = null;
+    if (stale()) return; // the departed attempt's failure is not the current one's business
     showSaveFailure("The save failed (network error). The recording is still here — you can retry.");
   };
-  xhr.onabort = () => { uploadXhr = null; };
+  xhr.onabort = () => { /* a retry or discard already moved the page on */ };
 
-  xhr.send(blob);
+  xhr.send(patched);
 }
 
-// The manage key is kept on this device as well: it deletes the clip even
-// signed out, and the account list covers everything else.
-function rememberLocally(data) {
-  const list = loadRecordings();
+// The manage key is cached on this device, under the account that recorded
+// the clip — the owner captured when the recording started, never whichever
+// account is signed in when the upload response arrives. Clips made signed in
+// never join the signed-out device list.
+function rememberLocally(data, ownerEmail, ownerTitle) {
+  if (!ownerEmail) return;
+  const list = loadRecordingsFor(ownerEmail);
   list.unshift({
-    id: data.id, token: data.manageToken, title: pendingTitle || null,
+    id: data.id, token: data.manageToken, title: ownerTitle || null,
     bytes: data.bytes, createdAt: data.createdAt
   });
-  saveRecordings(list);
+  saveRecordingsFor(ownerEmail, list);
 }
 
 function setProgress(fraction) {
@@ -702,13 +889,24 @@ function showSaveFailure(message) {
 // --- lists -----------------------------------------------------------------
 
 async function renderServerClips() {
+  const requestToken = token();
+  if (!requestToken) return;
   let clips = [];
   try {
-    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token() } });
-    if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + requestToken } });
+    if (res.status === 401) {
+      // a 401 for a session that has already ended must not sign out whoever
+      // is signed in now
+      if (!sessionChanged(requestToken)) signOut("Your session expired — sign in again.");
+      return;
+    }
+    if (!res.ok) return;
     clips = (await res.json()).clips || [];
   } catch { return; }
-  const tokens = new Map(loadRecordings().map((r) => [r.id, r.token]));
+  // a sign-out or account switch while the request was in flight must not
+  // repopulate the page with the departing account's clips
+  if (token() !== requestToken) return;
+  const tokens = new Map(loadAccountRecordings().map((r) => [r.id, r.token]));
   const ul = $("recList");
   ul.textContent = "";
   $("recEmpty").classList.toggle("hidden", clips.length > 0);
@@ -716,20 +914,20 @@ async function renderServerClips() {
     ul.appendChild(clipRow({
       id: clip.id, token: tokens.get(clip.id), title: clip.title,
       bytes: clip.bytes, createdAt: clip.createdAt
-    }, () => renderServerClips()));
+    }, () => renderServerClips(), "account"));
   }
   renderUsage({ clips: clips.length, bytes: clips.reduce((n, c) => n + (c.bytes || 0), 0) }, limits);
 }
 
 function renderDeviceRecordings() {
-  const list = loadRecordings();
+  const list = loadLegacyRecordings();
   $("deviceEmpty").classList.toggle("hidden", list.length > 0);
   const ul = $("deviceList");
   ul.textContent = "";
-  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings));
+  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings, "device"));
 }
 
-function clipRow(rec, refresh) {
+function clipRow(rec, refresh, kind) {
   const li = document.createElement("li");
 
   const title = document.createElement("span");
@@ -747,29 +945,35 @@ function clipRow(rec, refresh) {
   watch.textContent = "share";
   li.appendChild(watch);
 
-  const manage = document.createElement("a");
-  manage.href = "/v/" + rec.id + (rec.token ? "?k=" + encodeURIComponent(rec.token) : "");
-  manage.textContent = "manage";
-  li.appendChild(manage);
+  if (rec.token) {
+    const manage = document.createElement("a");
+    manage.href = "/v/" + rec.id + "?k=" + encodeURIComponent(rec.token);
+    manage.textContent = "manage";
+    li.appendChild(manage);
+  }
 
   const del = document.createElement("button");
   del.className = "danger del";
   del.textContent = "Delete";
-  del.onclick = () => deleteFromList(rec, refresh);
+  del.onclick = () => deleteFromList(rec, refresh, kind);
   li.appendChild(del);
 
   return li;
 }
 
-async function deleteFromList(rec, refresh) {
+async function deleteFromList(rec, refresh, kind) {
   if (!confirm("Delete “" + (rec.title || "Untitled recording") + "” for everyone with the link?")) return;
   const headers = {};
-  if (signedIn()) headers.Authorization = "Bearer " + token();
+  // a device recording carries its own key, which works signed out; an
+  // account clip is managed by the session
+  if (kind === "device" && rec.token) headers.Authorization = "Bearer " + rec.token;
+  else if (signedIn()) headers.Authorization = "Bearer " + token();
   else if (rec.token) headers.Authorization = "Bearer " + rec.token;
   try {
     const res = await fetch("/api/clips/" + encodeURIComponent(rec.id), { method: "DELETE", headers });
     if (res.status === 204 || res.status === 404) {
-      saveRecordings(loadRecordings().filter((r) => r.id !== rec.id));
+      if (kind === "device") saveLegacyRecordings(loadLegacyRecordings().filter((r) => r.id !== rec.id));
+      else saveAccountRecordings(loadAccountRecordings().filter((r) => r.id !== rec.id));
       refresh();
     } else if (res.status === 401) {
       alert("Sign in to manage this clip (or use its manage link).");
@@ -829,8 +1033,11 @@ async function deleteAccount() {
       headers: { Authorization: "Bearer " + token() }
     });
     if (res.ok) {
+      removeAccountRecordings(); // the clips and their keys are gone for good
       storageRemove(TOKEN_KEY);
       storageRemove(EMAIL_KEY);
+      clearDepartedAccountState(); // its result links and pending recording go with it
+      clearServerList();
       setStatus("setupStatus", "Your account and all its clips were deleted.", "ok");
       await refreshAccount();
     } else {
@@ -848,6 +1055,7 @@ let authMode = "signup";
 $("startBtn").onclick = startRecording;
 $("stopBtn").onclick = () => stopRecording(true);
 $("againBtn").onclick = () => {
+  saveOp = null; // any save still in flight no longer owns the page
   pendingBlob = null;
   $("title").value = "";
   show("setup");
@@ -855,6 +1063,7 @@ $("againBtn").onclick = () => {
 };
 $("retryBtn").onclick = () => saveRecording();
 $("discardBtn").onclick = () => {
+  saveOp = null; // any save still in flight no longer owns the page
   pendingBlob = null;
   show("setup");
   setStatus("setupStatus", "Discarded — nothing was saved.", "");

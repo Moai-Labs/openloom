@@ -23,7 +23,7 @@
 // product path.
 
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import puppeteer from "puppeteer";
@@ -145,15 +145,59 @@ async function startRecordingOn(page, title, opts = {}) {
     await page.click("#startBtn");
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
   }
+  // the test's own clock at the moment this recording began — the anchor the
+  // timer freshness check below needs (a page under load can stall its main
+  // thread for seconds, but it cannot run ahead of this)
+  page.__recStartedAt = Date.now();
 }
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
+}
+
+// Records on an already signed-in page and leaves it on the result screen
+// (the caller decides whether to keep the page open or close it).
+async function recordOnPage(page, title, settleMs = 4000) {
+  await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await fill(page, "#title", title);
+  await page.click("#startBtn");
+  try {
+    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  } catch {
+    // headless Chrome often cannot open the real picker: inject a synthetic
+    // capture source and record again
+    await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+    await page.click("#startBtn");
+    await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  }
+  page.__recStartedAt = Date.now(); // same anchor the timer check uses
+  await new Promise((r) => setTimeout(r, settleMs));
+  await page.click("#stopBtn");
+}
+
+
 
 async function stopAndCollect(page, opts = {}) {
   const seconds = opts.recordSeconds ?? 4;
   await new Promise((r) => setTimeout(r, seconds * 1000));
-  const timerText = await page.$eval("#timer", (el) => el.textContent);
-  const lo = Math.floor(seconds), hi = lo + 1;
-  if (!new RegExp(`0:0[${lo}${hi}]$`).test(timerText)) {
-    throw new Error(`timer looks wrong: ${timerText}`);
+  const timer = await page.evaluate(() => ({
+    text: document.getElementById("timer").textContent,
+    age: Math.round(performance.now() - recordStart)
+  }));
+  // The timer must belong to THIS recording, not a stale one that never
+  // reset (the round-3 regression this guards). A busy container can stall
+  // the page's main thread for seconds, so the page's own elapsed time is
+  // not trustworthy in either direction — but the page cannot run ahead of
+  // the test's clock: an age far beyond the time since this recording
+  // started means recordStart was never reset. A stale start carries the
+  // previous recording's whole elapsed time and fails by many seconds.
+  const sinceStart = Date.now() - page.__recStartedAt;
+  if (!/^\d+:\d\d$/.test(timer.text) || timer.age > sinceStart + 1500) {
+    throw new Error(`timer looks wrong: ${timer.text} (recording age ${timer.age} ms, ` +
+      `${sinceStart} ms since Start on the test's clock)`);
   }
   await page.click("#stopBtn");
   await page.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
@@ -203,6 +247,14 @@ const STARTUP_RACE_HARNESS = `
   };
 `;
 
+// A manage key must not appear anywhere rendered: no anchor points at a
+// manage link and no input still carries one. (body.innerHTML would match
+// this very script's own text — the page builds manage hrefs in JS — so the
+// check looks at elements, not at markup.)
+const PAGE_LEAKS_MANAGE_KEY = () =>
+  !!document.querySelector('a[href*="?k="]') ||
+  [...document.querySelectorAll("input")].some((i) => (i.value || "").includes("?k="));
+
 async function main() {
   await startServerIfLocal();
   const browser = await puppeteer.launch({ headless: "shell", args: BROWSER_FLAGS });
@@ -235,10 +287,18 @@ async function main() {
   check("Record another returns to setup with Start enabled", startEnabled === true);
   await startRecordingOn(flowPage, "Record another regression");
   await new Promise((r) => setTimeout(r, 1000));
-  const secondTimer = await flowPage.$eval("#timer", (el) => el.textContent);
+  // the second recording's timer must be running from ITS start — a busy
+  // container can display a lagging second, but not an age beyond the test's
+  // clock (that would be a stale timer from the first recording)
+  const secondTimer = await flowPage.evaluate(() => ({
+    text: document.getElementById("timer").textContent,
+    age: Math.round(performance.now() - recordStart)
+  }));
+  const secondTimerFresh = /^\d+:\d\d$/.test(secondTimer.text) &&
+    secondTimer.age <= Date.now() - flowPage.__recStartedAt + 1500;
   const second = await stopAndCollect(flowPage, { recordSeconds: 2 });
   check("a second recording starts and runs after Record another",
-    /^0:0[123]$/.test(secondTimer), secondTimer);
+    secondTimerFresh, JSON.stringify(secondTimer));
   check("the second recording saves its own clip",
     /Saved/.test(second.note) && /^video\//.test(second.mime), `${second.note} (${second.mime})`);
 
@@ -389,6 +449,283 @@ async function main() {
   check("a second account's list is private and empty", strangerEmail === "stranger@example.com" && strangerList === 0,
     `${strangerEmail}, ${strangerList} rows`);
 
+  // 4b. signing out must hide the departing creator's clips; signing in as
+  // somebody else on the same browser profile must expose none of them —
+  // no rows, no manage links, and a stale in-flight list request must not
+  // bring them back
+  const switcher = await authorContext.newPage();
+  switcher.on("dialog", (d) => d.accept());
+  await switcher.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await switcher.waitForFunction(() => document.querySelectorAll("#recList li").length === 3, { timeout: 15000 });
+  await switcher.click("#signOutLink");
+  await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const signedOutState = await switcher.waitForFunction(() =>
+    document.getElementById("clipsCard").classList.contains("hidden")
+      && document.querySelectorAll("#recList li").length === 0
+      && !document.querySelector('a[href*="?k="]')
+  , { timeout: 10000 }).then(() => true, () => switcher.evaluate(() => ({
+    rows: document.querySelectorAll("#recList li").length,
+    clipsHidden: document.getElementById("clipsCard").classList.contains("hidden"),
+    leaksKeys: !!document.querySelector('a[href*="?k="]')
+  })));
+  check("signing out empties the clip list and its manage keys",
+    signedOutState === true, JSON.stringify(signedOutState));
+  await fill(switcher, "#email", "successor@example.com");
+  await fill(switcher, "#password", "correct horse battery");
+  await switcher.click("#authBtn");
+  await switcher.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden")
+      && /of 3/.test(document.getElementById("usageText").textContent), { timeout: 15000 });
+  const successorState = await switcher.evaluate(() => ({
+    email: document.getElementById("whoami").textContent,
+    rows: document.querySelectorAll("#recList li").length,
+    leaksKeys: !!document.querySelector('a[href*="?k="]')
+  }));
+  check("another creator on the same browser sees none of the first creator's clips",
+    successorState.email === "successor@example.com" && successorState.rows === 0 && !successorState.leaksKeys,
+    JSON.stringify(successorState));
+  // hand the shared profile back to the original author for the later steps
+  await switcher.click("#signOutLink");
+  await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await switcher.click("#signInLink");
+  await fill(switcher, "#email", "author@example.com");
+  await fill(switcher, "#password", "correct horse battery");
+  await switcher.click("#authBtn");
+  await switcher.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await switcher.close();
+
+  // 4c. signing out from the saved-result screen must not leave the departing
+  // creator's links behind, nor hand them to whoever signs in next
+  const resultContext = await browser.createBrowserContext();
+  const resultPage = await resultContext.newPage();
+  resultPage.on("pageerror", (err) => console.error("  [pageerror]", err.message));
+  await signUp(resultPage, "resultauthor@example.com");
+  await recordOnPage(resultPage, "Result-screen signout");
+  await resultPage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const manageLinkValue = await resultPage.$eval("#manageLink", (el) => el.value);
+  const manageToken = decodeURIComponent((manageLinkValue.split("?k=")[1] || ""));
+  check("a saved result shows its manage link before sign-out", /^https?:\/\/.+/.test(manageLinkValue), manageLinkValue);
+  await resultPage.click("#signOutLink");
+  await resultPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const clearedResult = await resultPage.evaluate(() => ({
+    resultHidden: document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    manage: document.getElementById("manageLink").value
+  }));
+  clearedResult.leak = await resultPage.evaluate(PAGE_LEAKS_MANAGE_KEY);
+  check("signing out from the result screen clears its links",
+    clearedResult.resultHidden && clearedResult.share === "" && clearedResult.manage === "" && !clearedResult.leak,
+    JSON.stringify(clearedResult));
+  await fill(resultPage, "#email", "resultnext@example.com");
+  await fill(resultPage, "#password", "correct horse battery");
+  await resultPage.click("#authBtn");
+  await resultPage.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  const successorCache = await resultPage.evaluate((tok) => ({
+    own: localStorage.getItem("openloom.recordings:resultnext@example.com"),
+    legacy: localStorage.getItem("openloom.recordings"),
+    ownerCacheKept: (localStorage.getItem("openloom.recordings:resultauthor@example.com") || "").includes(tok)
+  }), manageToken);
+  successorCache.leak = await resultPage.evaluate(PAGE_LEAKS_MANAGE_KEY);
+  check("the successor's UI and cache carry none of the departing creator's keys",
+    successorCache.own === null && !successorCache.leak &&
+      !(successorCache.legacy || "").includes(manageToken),
+    JSON.stringify({ ...successorCache, ownerCacheKept: "checked-below" }));
+  check("the departing creator's own cache survives for their next session",
+    successorCache.ownerCacheKept);
+  await resultPage.close();
+
+  // 4d. an upload response that lands after an account switch belongs to the
+  // account that submitted it: no links for the successor, the manage key
+  // cached under its owner, the successor's session untouched
+  const switchContext = await browser.createBrowserContext();
+  const switchPage = await switchContext.newPage();
+  switchPage.on("pageerror", (err) => console.error("  [pageerror]", err.message));
+  await switchPage.setRequestInterception(true);
+  let heldUpload = null;
+  let releaseUpload = null;
+  const uploadHeld = new Promise((r) => { releaseUpload = r; });
+  switchPage.on("request", (req) => {
+    if (!heldUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      heldUpload = req; // held: the response will only land after the switch
+      releaseUpload();
+      return;
+    }
+    if (req.method() === "DELETE" && req.url().includes("/api/sessions/current")) {
+      // the sign-out call must not reach the server, so the departing session
+      // stays valid and the held upload can complete for its owner
+      req.respond({ status: 500 });
+      return;
+    }
+    req.continue();
+  });
+  await signUp(switchPage, "switchauthor@example.com");
+  await recordOnPage(switchPage, "Switch-during-upload", 2500);
+  await withTimeout(uploadHeld, 30000, "the upload request was never issued");
+  const switchAuthorToken = await switchPage.evaluate(() => localStorage.getItem("openloom.token"));
+  await switchPage.click("#signOutLink");
+  await switchPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await fill(switchPage, "#email", "switchnext@example.com");
+  await fill(switchPage, "#password", "correct horse battery");
+  await switchPage.click("#authBtn");
+  await switchPage.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden")
+      && /of 3/.test(document.getElementById("usageText").textContent), { timeout: 15000 });
+  await heldUpload.continue();
+  // The reviewed stale-callback guard deliberately suppresses a departed
+  // attempt's completion — sign-out set saveOp aside, so the late response
+  // drops quietly instead of painting anything on the successor's page.
+  // The clip itself is still saved to the account that submitted it (checked
+  // below through the API and the owner's cache).
+  await new Promise((r) => setTimeout(r, 1500));
+  const suppressed = await switchPage.evaluate(() => ({
+    who: document.getElementById("whoami").textContent,
+    resultHidden: document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    manage: document.getElementById("manageLink").value,
+    ownCache: localStorage.getItem("openloom.recordings:switchnext@example.com"),
+    nextToken: localStorage.getItem("openloom.token")
+  }));
+  suppressed.leak = await switchPage.evaluate(PAGE_LEAKS_MANAGE_KEY);
+  check("an upload finishing under a switched-in account shows none of the owner's links",
+    !!suppressed && suppressed.who === "switchnext@example.com" && suppressed.resultHidden
+      && suppressed.share === "" && suppressed.manage === "" && !suppressed.leak
+      && suppressed.ownCache === null && suppressed.nextToken !== switchAuthorToken,
+    JSON.stringify(suppressed));
+  const switchClips = await (await fetch(baseUrl + "/api/my/clips", {
+    headers: { Authorization: "Bearer " + switchAuthorToken }
+  })).json();
+  check("the clip from the switched upload is saved to the account that submitted it",
+    (switchClips.clips || []).length === 1, JSON.stringify((switchClips.clips || []).length));
+  const ownerCacheHasIt = await switchPage.evaluate(async (email, token) => {
+    const raw = localStorage.getItem("openloom.recordings:" + email);
+    if (!raw) return false;
+    const clips = (await (await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token } })).json()).clips;
+    const cache = JSON.parse(raw);
+    return clips.length === 1 && cache.some((r) => r.id === clips[0].id && r.token);
+  }, "switchauthor@example.com", switchAuthorToken);
+  check("the manage key from the switched upload lands in its owner's cache", ownerCacheHasIt);
+  await switchPage.close();
+
+  // 4e. the successor records a clip while the departing owner's upload is
+  // still pending: the stale completion must not erase the successor's
+  // pending blob, title or owner, and the successor can still save,
+  // download and retry their own recording afterwards
+  const staleContext = await browser.createBrowserContext();
+  const stalePage = await staleContext.newPage();
+  const staleErrors = [];
+  stalePage.on("pageerror", (err) => staleErrors.push(err.message));
+  await stalePage.setRequestInterception(true);
+  let heldStaleUpload = null;
+  let releaseStaleUpload = null;
+  let failNextUpload = false;
+  const staleUploadHeld = new Promise((r) => { releaseStaleUpload = r; });
+  stalePage.on("request", (req) => {
+    if (!heldStaleUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      heldStaleUpload = req; // the departing owner's upload: held past the switch
+      releaseStaleUpload();
+      return;
+    }
+    if (failNextUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      failNextUpload = false;
+      req.respond({ status: 500, body: '{"error":"stubbed failure"}', contentType: "application/json" });
+      return;
+    }
+    if (req.method() === "DELETE" && req.url().includes("/api/sessions/current")) {
+      // the sign-out call must not reach the server, so the departing session
+      // stays valid and the held upload can complete for its owner
+      req.respond({ status: 500 });
+      return;
+    }
+    req.continue();
+  });
+  await signUp(stalePage, "pendingowner@example.com");
+  const staleOwnerToken = await stalePage.evaluate(() => localStorage.getItem("openloom.token"));
+  await recordOnPage(stalePage, "Owner upload pending", 2500);
+  await withTimeout(staleUploadHeld, 30000, "the owner's upload request was never issued");
+
+  // the departure, then the successor on the same page
+  await stalePage.click("#signOutLink");
+  await stalePage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await fill(stalePage, "#email", "afterpending@example.com");
+  await fill(stalePage, "#password", "correct horse battery");
+  await stalePage.click("#authBtn");
+  await stalePage.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+
+  // the successor records while the owner's upload is still held — no
+  // navigation in between, so the held request stays alive
+  await fill(stalePage, "#title", "Successor clip one");
+  await stalePage.click("#startBtn");
+  await stalePage.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  await new Promise((r) => setTimeout(r, 2500));
+  await stalePage.click("#stopBtn");
+  await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const successorShare = await stalePage.$eval("#shareLink", (el) => el.value);
+
+  // now the stale upload completes, under a page the successor owns
+  await heldStaleUpload.continue();
+  await new Promise((r) => setTimeout(r, 1000));
+  const afterStale = await stalePage.evaluate(() => ({
+    resultShown: !document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    status: document.getElementById("setupStatus").textContent,
+    rows: document.querySelectorAll("#recList li").length
+  }));
+  check("a stale upload completion leaves the successor's saved result alone",
+    afterStale.resultShown && afterStale.share === successorShare
+      && !/changed accounts|did not go through/.test(afterStale.status)
+      && afterStale.rows === 1,
+    JSON.stringify(afterStale));
+  const staleOwnerClips = await (await fetch(baseUrl + "/api/my/clips", {
+    headers: { Authorization: "Bearer " + staleOwnerToken }
+  })).json();
+  check("the held upload still saved to the account that submitted it",
+    (staleOwnerClips.clips || []).length === 1, JSON.stringify((staleOwnerClips.clips || []).length));
+
+  // the successor's second recording: the save fails once (stubbed 500), so
+  // the failure screen offers download and retry on the successor's own blob
+  failNextUpload = true;
+  await stalePage.click("#againBtn"); // back from clip one's result screen
+  await stalePage.waitForSelector("#setup:not(.hidden)", { timeout: 5000 });
+  await fill(stalePage, "#title", "Successor clip two");
+  await stalePage.click("#startBtn");
+  await stalePage.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  await new Promise((r) => setTimeout(r, 2000));
+  await stalePage.click("#stopBtn");
+  await stalePage.waitForSelector("#failed:not(.hidden)", { timeout: 60000 });
+  check("a failed save shows the retry screen for the successor's own recording",
+    /Successor clip two|failed/i.test(await stalePage.$eval("#failNote", (el) => el.textContent)));
+
+  // download a copy of the successor's pending recording. The behavior must
+  // be scoped to this page's non-default browser context: Chrome 156 applies
+  // an unscoped Browser.setDownloadBehavior to the default context only, so
+  // a page launched in its own context would download to nowhere.
+  const downloadDir = mkdtempSync(path.join(tmpdir(), "openloom-dl-"));
+  await staleContext.setDownloadBehavior({ policy: "allow", downloadPath: downloadDir });
+  await stalePage.click("#localBtn");
+  let downloaded = false;
+  for (let i = 0; i < 50 && !downloaded; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    downloaded = readdirSync(downloadDir).some((f) => f.startsWith("recording"));
+  }
+  check("the successor can download their own pending recording", downloaded,
+    JSON.stringify(readdirSync(downloadDir)));
+
+  // and the retry saves it
+  await stalePage.click("#retryBtn");
+  await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const retried = await stalePage.evaluate(() => ({
+    share: document.getElementById("shareLink").value,
+    rows: document.querySelectorAll("#recList li").length
+  }));
+  check("the successor can retry their own recording after a stale completion",
+    /^http.*\/v\/[A-Za-z0-9_-]+$/.test(retried.share) && retried.rows === 2,
+    JSON.stringify(retried));
+  check("no page errors through the stale-completion scenario", staleErrors.length === 0,
+    staleErrors.join(" | "));
+  rmSync(downloadDir, { recursive: true, force: true });
+  await stalePage.close();
+
   // 9. a viewer without any account opens a share link. Metadata is not
   // playback: start the video and require time to advance without a media
   // error — this is what "plays for a viewer" means.
@@ -421,7 +758,7 @@ async function main() {
   check("video actually plays for the viewer", played.ok === true, played.why);
 
   // 10. the original downloads byte-identical
-  const downloaded = await viewer.evaluate(async () => {
+  const viewerDownload = await viewer.evaluate(async () => {
     const res = await fetch(document.getElementById("downloadBtn").href);
     const buf = await res.arrayBuffer();
     const digest = await crypto.subtle.digest("SHA-256", buf);
@@ -433,11 +770,11 @@ async function main() {
       hash: [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")
     };
   });
-  check("download returns 200", downloaded.status === 200, `type ${downloaded.type}`);
+  check("download returns 200", viewerDownload.status === 200, `type ${viewerDownload.type}`);
   check("download is byte-identical to what was recorded",
-    downloaded.hash === author.blobHash,
-    `${downloaded.bytes} bytes, hashes ${downloaded.hash === author.blobHash ? "match" : "differ"}`);
-  check("download has an attachment filename", /attachment/.test(downloaded.disposition || ""), downloaded.disposition);
+    viewerDownload.hash === author.blobHash,
+    `${viewerDownload.bytes} bytes, hashes ${viewerDownload.hash === author.blobHash ? "match" : "differ"}`);
+  check("download has an attachment filename", /attachment/.test(viewerDownload.disposition || ""), viewerDownload.disposition);
 
   // 11. the manage link deletes from a completely different browser session
   const managerContext = await browser.createBrowserContext();
