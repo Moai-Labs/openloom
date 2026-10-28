@@ -41,10 +41,11 @@ account-free share links. Zero runtime dependencies — Node stdlib only.
 - **Duration patched client-side before upload** so the stored original is
   already correct for every viewer; the unpatched blob is uploaded if the
   patcher fails (try/catch + 5 s timeout race).
-- **No volume in deploy.json yet.** Clips live in the container filesystem, so
-  a redeploy wipes them. Persistence is explicitly post #18's scope; adding a
-  volume without knowing its mount path was a risk not worth taking blind.
-  Stated openly in the post thread instead.
+- **No volume in deploy.json yet** (superseded 2026-10-28, review round 1
+  asked for durable storage now): `deploy.json` provisions a 5 GB volume
+  mounted at `/data` and sets `DATA_DIR=/data` — the same convention the
+  post-18 and post-19 branches use. The Dockerfile's `/app/data` is only the
+  in-container fallback.
 
 ## Verification
 
@@ -66,10 +67,32 @@ account-free share links. Zero runtime dependencies — Node stdlib only.
 
 ## Known limits, deliberately deferred
 
-- Container redeploys wipe clips (no volume yet) — post #18.
 - No accounts, no published limits, no per-clip listing on the server — post #18.
 - Seeking in unpatched webm (when the patcher fails) is limited; playback still
   works.
+
+## Review round 1 changes (2026-10-28)
+
+- `lib/store.js`: failure cleanup now removes only this upload's staging file
+  (never the shared tmp dir), tears down its streams, and cleans staging up on
+  publication failure too. Oversized bodies are drained up to 1 MB so the 413
+  reaches the client, then the connection is cut. Three concurrent-upload
+  tests (empty/aborted/oversized against a gated in-flight save) and a
+  streaming-oversized test pin this down.
+- `public/recorder.html`: display audio + microphone are mixed into one track
+  via Web Audio (Chrome MediaRecorder cannot take two audio tracks); original
+  streams and the AudioContext are released on success and failure alike, and
+  `recorder.start()` failures are caught. E2E regression check records with
+  both sources and verifies the clip contains audio (decodeAudioData).
+- `public/watch.html`: real `.hidden` CSS; the E2E now asserts rendered
+  visibility (computed style + client rects) for viewers (hidden) and the
+  manage key (shown), not a class name.
+- `deploy.json`: `volume_gb: 5`, `DATA_DIR=/data`; README updated. Verified
+  locally that a clip survives killing the server and booting a fresh one on
+  the same data dir (byte-identical download, original manage key deletes) —
+  the same check on the deployed container happens via the dev preview.
+- Tests: 16 API tests (was 13), all passing, stable across 5 runs. E2E:
+  13 checks (was 10), all passing.
 
 ## Running the E2E in this dev container (2026-10-28)
 
