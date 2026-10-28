@@ -429,6 +429,16 @@ async function createInvoice(req, res, account) {
     });
 }
 
+// The plan's live paidUntil as the committed state holds it right now —
+// not the snapshot the request started with, which a concurrent verify may
+// already have moved past. It reads after publish, so it never observes an
+// uncommitted plan, and it changes nothing: an extension happens only on
+// the one path per invoice whose markPaid finalized the payment.
+function livePaidUntil(accountId) {
+    const current = accounts.peek(accountId);
+    return current ? payments.activePaidUntil(current) : null;
+}
+
 async function verifyInvoicePayment(req, res, account) {
     const body = await readJsonBody(req);
     const invoiceId = body && body.invoiceId;
@@ -444,7 +454,7 @@ async function verifyInvoicePayment(req, res, account) {
     }
     if (invoice.status === "paid") {
         // Idempotent: verifying the same invoice twice answers with the plan, not an error.
-        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: payments.activePaidUntil(account), alreadyPaid: true });
+        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: livePaidUntil(account.id), alreadyPaid: true });
         return;
     }
     if (invoice.status === "expired") {
@@ -479,19 +489,24 @@ async function verifyInvoicePayment(req, res, account) {
     }
 
     // Verified: one transaction pays one invoice, and the plan starts now.
-    // markPaid serializes against every other invoice mutation — if a second
-    // request verified this same invoice with the same receipt while this one
-    // was on the wire, it answers already-paid here and the plan is not
-    // extended twice. The invoice's paid state and the account's plan each
-    // commit inside their ledger's serialization, so neither can end up
-    // half-applied across a crash or a competing write.
+    // markPaid serializes against every other invoice mutation and re-checks
+    // everything inside the lock — a concurrent verify of the same receipt
+    // answers already-paid here so the plan is not extended twice, a hash
+    // another invoice already took is refused, and an invoice that expired
+    // while the verification was on the wire is not paid. The invoice and
+    // the account each publish only once their own commit has landed, so a
+    // competing write or a crash cannot leave a half-applied state in
+    // memory; if a crash ever separated the two commits on disk, the
+    // idempotent path below heals the missing plan.
     const { already } = await invoices.markPaid(invoice.id, { txHash: txHash.toLowerCase(), paidAt: Date.now() });
-    if (already) {
-        sendJson(res, 200, { status: "paid", tier: "paid", paidUntil: payments.activePaidUntil(account), alreadyPaid: true, test: true });
-        return;
-    }
-    const paidUntil = await accounts.setPlan(account.id, payments.extendPaid);
-    sendJson(res, 200, { status: "paid", tier: "paid", paidUntil, test: true });
+    // A payment this request finalized extends the plan — markPaid answers
+    // already=false to exactly one request per invoice, so the plan is
+    // extended exactly once; the request that lost the race reports the
+    // plan as the committed state holds it.
+    const paidUntil = already ? livePaidUntil(account.id) : await accounts.setPlan(account.id, payments.extendPaid);
+    const reply = { status: "paid", tier: "paid", paidUntil, test: true };
+    if (already) reply.alreadyPaid = true;
+    sendJson(res, 200, reply);
 }
 
 // One-time, short-lived links let the browser download the export with an

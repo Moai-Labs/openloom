@@ -1026,4 +1026,167 @@ test("two concurrent verifies of the same receipt extend the plan once", { timeo
   assert.equal(stored[0].status, "paid");
 });
 
+// --- concurrency: finalization and publication ------------------------------
+// These pin review round 2: invoice finalization must re-check replay and
+// expiry inside its mutation lock, and account mutations must publish
+// nothing until their persistence commit has landed.
+
+test("an invoice that expires during verification is never finalized", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-inv-exp-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new payments.Invoices(dir);
+  await ledger.init();
+
+  // An invoice with 50 ms to live: a verify's preliminary checks run while
+  // it is pending, the (stubbed) chain answers after it has expired, and
+  // finalization — whose checks run inside the mutation lock, at the clock
+  // of that moment — must refuse a dead request.
+  const invoice = await ledger.create("account-1", Date.now() - payments.INVOICE_TTL_MS + 50);
+  await new Promise((r) => setTimeout(r, 80));
+  const txHash = "0x" + "d4".repeat(32);
+  const failed = await ledger.markPaid(invoice.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.ok(failed, "the expired invoice is not paid");
+  assert.equal(failed.status, 410);
+  assert.equal(ledger.find(invoice.id).status, "pending", "the invoice is left as it was");
+  assert.equal(ledger.findByTx(txHash), null, "the transaction is not recorded against it");
+
+  // the refusal holds on disk too
+  const reopened = new payments.Invoices(dir);
+  await reopened.init();
+  assert.equal(reopened.find(invoice.id).status, "pending");
+  assert.equal(reopened.findByTx(txHash), null);
+
+  // a live invoice finalizes under the same clock — the letters of the
+  // hash must not matter
+  const live = await ledger.create("account-1");
+  const paid = await ledger.markPaid(live.id, { txHash: txHash.toUpperCase().replace(/^0X/, "0x"), paidAt: Date.now() });
+  assert.equal(paid.already, false);
+  assert.equal(ledger.find(live.id).status, "paid");
+  assert.equal(ledger.find(live.id).txHash, txHash, "the hash is stored normalized");
+
+  // the same transaction again on the paid invoice is idempotent…
+  const sameTx = await ledger.markPaid(live.id, { txHash, paidAt: Date.now() });
+  assert.equal(sameTx.already, true);
+  // …a second invoice cannot take the spent hash…
+  const second = await ledger.create("account-2");
+  const spent = await ledger.markPaid(second.id, { txHash, paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.ok(spent, "the spent hash is refused on a second invoice");
+  assert.equal(spent.status, 402);
+  // …and neither a malformed hash nor a foreign hash passes the lock
+  const malformed = await ledger.markPaid(second.id, { txHash: "0x1234", paidAt: Date.now() }).then(() => null, (err) => err);
+  assert.equal(malformed.status, 400);
+  assert.equal(ledger.find(second.id).status, "pending");
+});
+
+test("one transaction cannot pay two invoices verified concurrently", { timeout: 8000 }, async () => {
+  const a = await makeAccount("dual-a@example.com");
+  const b = await makeAccount("dual-b@example.com");
+  const invA = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${a.token}` } })).body);
+  const invB = JSON.parse((await request("POST", "/api/billing/invoices", { headers: { authorization: `Bearer ${b.token}` } })).body);
+
+  // One transaction whose receipt carries a transfer to BOTH invoice
+  // addresses: judged on its own, each verification looks like the exact
+  // payment for its invoice. Both verifies sit on the stubbed chain before
+  // either can finalize, so both pass the route's preliminary replay check
+  // — the race only the lock's own check can settle.
+  const sharedHash = "0x" + "c9".repeat(32);
+  const receipt = {
+    status: "0x1",
+    logs: [
+      transferLog({ contract: payments.USDC_CONTRACT, to: invA.payTo, microUsdc: 10_000_000n }),
+      transferLog({ contract: payments.USDC_CONTRACT, to: invB.payTo, microUsdc: 10_000_000n })
+    ]
+  };
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  const slowFetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const result = body.method === "eth_chainId"
+      ? "0x" + BigInt(payments.CHAIN_ID).toString(16)
+      : body.method === "eth_getTransactionReceipt" ? receipt : null;
+    await gate;
+    return { ok: true, json: async () => ({ jsonrpc: "2.0", id: 1, result }) };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = slowFetch;
+  const attempts = [
+    { inv: invA, token: a.token },
+    { inv: invB, token: b.token }
+  ].map(({ inv, token }) => request("POST", "/api/billing/verify", {
+    body: JSON.stringify({ invoiceId: inv.invoiceId, txHash: sharedHash }),
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` }
+  }));
+  await new Promise((r) => setTimeout(r, 100));
+  openGate();
+  globalThis.fetch = realFetch;
+  const settled = await Promise.allSettled(attempts);
+  const statuses = settled.map((s) => s.value.status).sort();
+  assert.deepEqual(statuses, [200, 402], "exactly one verification may finalize");
+
+  const answers = settled.map((s) => JSON.parse(s.value.body));
+  const paidOnes = answers.filter((x) => x.status === "paid");
+  assert.equal(paidOnes.length, 1, "one transaction pays one invoice");
+  assert.ok(paidOnes[0].paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000, "the winner holds a full 30 days");
+  const refused = answers.find((x) => x.status !== "paid");
+  assert.match(refused.error, /already used/i);
+
+  // the ledger records the transaction exactly once, on the paid invoice
+  const raw = fs.readFileSync(path.join(process.env.DATA_DIR, "invoices.json"), "utf8");
+  const withHash = JSON.parse(raw).invoices.filter((i) => i.txHash === sharedHash);
+  assert.equal(withHash.length, 1, "the shared transaction is recorded once");
+  assert.equal(withHash[0].status, "paid");
+
+  // and exactly one of the two accounts holds the plan
+  const plans = [];
+  for (const who of [a, b]) {
+    const mine = JSON.parse((await request("GET", "/api/me", { headers: { authorization: `Bearer ${who.token}` } })).body);
+    plans.push(mine.plan);
+  }
+  assert.deepEqual(plans.sort(), ["free", "paid"]);
+});
+
+test("a plan upgrade is invisible to readers until its commit lands", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-plan-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ledger = new Accounts(dir);
+  await ledger.init();
+  const made = await ledger.create("reader@example.com", "correct horse battery");
+
+  // Hold the plan's commit on the wire, the way a slow or failing disk would.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let holding = true;
+  const realCommit = ledger.commit.bind(ledger);
+  ledger.commit = async (state) => {
+    if (!holding) return realCommit(state);
+    await held;
+    holding = false;
+    throw new Error("disk full");
+  };
+
+  // The upgrade starts and its commit hangs; meanwhile readers authenticate.
+  const upgrade = ledger.setPlan(made.id, payments.extendPaid);
+  await new Promise((r) => setTimeout(r, 20));
+  const whilePending = await ledger.auth(made.token);
+  assert.equal(whilePending.plan, undefined, "no uncommitted plan reaches a reader while the write runs");
+
+  // The write fails: the reader still sees exactly what the disk holds.
+  release();
+  const failed = await upgrade.then(() => null, (err) => err);
+  assert.ok(failed, "the upgrade fails when its commit fails");
+  assert.equal((await ledger.auth(made.token)).plan, undefined, "still free after the failed commit");
+  const raw = fs.readFileSync(path.join(dir, "accounts.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(raw), "the persisted file is valid JSON");
+  assert.ok(!raw.includes("paidUntil"), "the uncommitted plan never reached the disk");
+
+  // and a later upgrade commits, becomes visible, and survives a restart
+  ledger.commit = realCommit;
+  const paidUntil = await ledger.setPlan(made.id, payments.extendPaid);
+  assert.ok(paidUntil > Date.now() + 29 * 24 * 60 * 60 * 1000);
+  assert.equal((await ledger.auth(made.token)).plan.tier, "paid");
+  const reopened = new Accounts(dir);
+  await reopened.init();
+  assert.equal((await reopened.auth(made.token)).plan.tier, "paid");
+});
+
 after(() => new Promise((resolve) => server.close(() => resolve())));

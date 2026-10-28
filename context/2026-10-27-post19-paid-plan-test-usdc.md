@@ -112,3 +112,43 @@ The platform review asked for three changes, all made in one commit:
   rollback, concurrent invoice create/expire, valid upload vs concurrent
   empty + oversized uploads, double-verify race). Verified stable across
   repeated runs and a 3-round soak of 60 concurrent operations.
+
+## Review round 2 (2026-10-28): finalization and publication
+
+Two changes, one commit:
+
+- **`Invoices.markPaid` re-checks everything inside the mutation lock.**
+  The verify route's pre-RPC checks are only fast paths: a concurrent
+  verification can pass them and still be on the wire when another one
+  finalizes. Inside the lock markPaid now (a) normalizes and validates the
+  txHash (lowercase, `TX_HASH_PATTERN`, else 400), (b) refuses a hash any
+  *other* invoice already holds (402) — so a receipt carrying transfers to
+  two invoice addresses pays at most one, (c) requires the invoice to be
+  pending and unexpired (410), judged at lock-entry time — an invoice that
+  expires while its verification is on the wire is never paid, and (d)
+  keeps the idempotent path: same invoice + same tx → `{already: true}`.
+  Marking paid is also copy-on-write now (new invoice object replaces the
+  old only after the commit), matching the accounts pattern.
+- **Accounts publish after commit.** Mutations no longer assign
+  `this.data` (or mutate an account object) before the write: each builds
+  a candidate snapshot, `commit(candidate)` persists it, and only then
+  does it become live. `setPlan` copies the account before handing it to
+  `planOf` (extendPaid), so the object `auth()` handed a reader never
+  gains an uncommitted plan in place. A failed commit now leaves nothing
+  to roll back — memory only ever holds committed state. `auth()` still
+  reads without the queue, which is now safe by construction; new
+  `peek(accountId)` gives the route a fresh committed copy when an
+  idempotent re-verify must report the plan as it stands now rather than
+  the request's start-of-request snapshot.
+- **Verify route**: extensions happen exactly once per invoice — only the
+  request whose `markPaid` returned `already: false` extends the plan;
+  `already: true` answers with `livePaidUntil(accountId)` (current
+  committed plan). The old heal-on-idempotent idea was discarded during
+  this round: healing before the winner's setPlan lands would extend the
+  plan twice, and a crash between the invoice commit and the plan commit
+  remains a known (fsync-wide) window rather than a race.
+- Suite grew 41 → 44: expiry-during-verification (with normalization,
+  idempotence, spent-hash and malformed-hash checks), the two-invoice
+  concurrent replay race over HTTP, and the blocked-then-failed plan
+  commit with concurrent auth readers. Verified stable across repeated
+  runs.
