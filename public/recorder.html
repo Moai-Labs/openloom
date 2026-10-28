@@ -163,7 +163,8 @@ const MIME_CANDIDATES = [
 
 // --- state ---------------------------------------------------------------
 
-let recorder = null;
+let recorder = null;        // the active MediaRecorder (set only once started)
+let recorderError = null;   // set by onerror; finalization runs once, from stop
 let recordingStream = null;
 let displayStream = null;
 let micStream = null;
@@ -171,6 +172,7 @@ let audioContext = null;
 let chunks = [];
 let recordStart = 0;
 let timerHandle = 0;
+let starting = false;       // a start attempt is between click and success/failure
 let pendingBlob = null;
 let pendingDurationMs = 0;
 let pendingTitle = "";
@@ -223,60 +225,73 @@ function pickMime() {
 // --- recording ------------------------------------------------------------
 
 async function startRecording() {
-  const title = $("title").value.trim();
+  // Synchronous re-entry guard: the picker and permission prompts are async,
+  // so nothing below the first await has run when a second click arrives.
+  if (starting || recorder) return;
+  starting = true;
+  $("startBtn").disabled = true;
+
   const mime = pickMime();
   if (!mime) {
-    setStatus("setupStatus", "This browser cannot record video (MediaRecorder missing). Desktop Chrome is supported.", "error");
+    startupFailed(null, "This browser cannot record video (MediaRecorder missing). Desktop Chrome is supported.");
     return;
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-    setStatus("setupStatus", "This browser has no screen capture. Please use desktop Chrome.", "error");
+    startupFailed(null, "This browser has no screen capture. Please use desktop Chrome.");
     return;
   }
 
-  let display;
+  // Every resource this attempt captures stays local until it becomes the
+  // active recording; each cancelled or failed path releases exactly these.
+  const attempt = { display: null, mic: null, audioContext: null, stream: null };
+
   try {
-    display = await navigator.mediaDevices.getDisplayMedia({
+    attempt.display = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30, max: 30 } },
       audio: true
     });
   } catch (err) {
     if (err && (err.name === "NotAllowedError" || err.name === "AbortError")) {
-      setStatus("setupStatus", "Recording cancelled — nothing was captured.", "error");
+      startupFailed(attempt, "Recording cancelled — nothing was captured.");
     } else {
-      setStatus("setupStatus", "Could not start screen capture: " + (err && err.message ? err.message : err), "error");
+      startupFailed(attempt, "Could not start screen capture: " + (err && err.message ? err.message : err));
     }
     return;
   }
 
   // The microphone is separate from the share picker's audio.
-  let mic = null;
   try {
-    mic = await navigator.mediaDevices.getUserMedia({
+    attempt.mic = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true }
     });
   } catch {
     setStatus("setupStatus", "Microphone unavailable — recording with the captured audio only.", "");
   }
 
-  displayStream = display;
-  micStream = mic;
+  // Screen sharing can end (Chrome's "Stop sharing") while the microphone
+  // prompt was still up: never hand an already-ended display track to
+  // MediaRecorder.
+  const videoTrack = attempt.display.getVideoTracks()[0];
+  if (!videoTrack || videoTrack.readyState !== "live") {
+    startupFailed(attempt, "Screen sharing ended before recording could start.");
+    return;
+  }
 
   // Chrome's picker can supply display audio while the microphone also came
   // through — but MediaRecorder cannot record two audio tracks at once. Mix
   // every audio source into a single track with Web Audio first.
-  const micTracks = mic ? [...mic.getAudioTracks()] : [];
-  const displayAudioTracks = [...display.getAudioTracks()];
+  const micTracks = attempt.mic ? [...attempt.mic.getAudioTracks()] : [];
+  const displayAudioTracks = [...attempt.display.getAudioTracks()];
   let audioTrack = null;
   if (micTracks.length + displayAudioTracks.length > 0) {
     try {
-      audioContext = new AudioContext();
-      const mixed = audioContext.createMediaStreamDestination();
+      attempt.audioContext = new AudioContext();
+      const mixed = attempt.audioContext.createMediaStreamDestination();
       for (const t of micTracks) {
-        audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
+        attempt.audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
       }
       for (const t of displayAudioTracks) {
-        audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
+        attempt.audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
       }
       audioTrack = mixed.stream.getAudioTracks()[0] || null;
     } catch {
@@ -285,29 +300,44 @@ async function startRecording() {
     }
   }
 
-  recordingStream = new MediaStream([...display.getVideoTracks(), ...(audioTrack ? [audioTrack] : [])]);
+  attempt.stream = new MediaStream([videoTrack, ...(audioTrack ? [audioTrack] : [])]);
 
+  let rec;
   try {
-    recorder = new MediaRecorder(recordingStream, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
-
-    chunks = [];
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-    recorder.onerror = (e) => finishRecording(true, e.error);
-    recorder.onstop = () => finishRecording(false, null);
-
-    // Chrome's "Stop sharing" button ends the video track: treat it as stop.
-    const videoTrack = display.getVideoTracks()[0];
-    if (videoTrack) videoTrack.addEventListener("ended", () => stopRecording(false), { once: true });
-
-    recordStart = performance.now();
-    recorder.start(1000);
+    rec = new MediaRecorder(attempt.stream, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
   } catch (err) {
-    recorder = null;
-    releaseCapture();
-    setStatus("setupStatus", "Could not start the recorder: " + (err && err.message ? err.message : err), "error");
+    startupFailed(attempt, "Could not start the recorder: " + (err && err.message ? err.message : err));
     return;
   }
-  pendingTitle = title;
+
+  chunks = [];
+  recorderError = null;
+  rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  // An error is followed by a final dataavailable and a stop event: record
+  // the failure here and let the stop event finalize exactly once.
+  rec.onerror = (e) => { recorderError = e.error || new Error("unknown recorder error"); };
+  rec.onstop = () => finalizeRecording();
+
+  // Chrome's "Stop sharing" button ends the video track: treat it as stop.
+  videoTrack.addEventListener("ended", () => stopRecording(false), { once: true });
+
+  try {
+    rec.start(1000);
+  } catch (err) {
+    rec.ondataavailable = rec.onerror = rec.onstop = null;
+    startupFailed(attempt, "Could not start the recorder: " + (err && err.message ? err.message : err));
+    return;
+  }
+
+  // The attempt is now the active recording: promote it to the shared state.
+  recorder = rec;
+  recordingStream = attempt.stream;
+  displayStream = attempt.display;
+  micStream = attempt.mic;
+  audioContext = attempt.audioContext;
+  pendingTitle = $("title").value.trim();
+  recordStart = performance.now();
+  starting = false;
 
   show("recording");
   timerHandle = setInterval(() => {
@@ -317,9 +347,25 @@ async function startRecording() {
     $("sizeNote").textContent = bytes > 1024 ? " · " + fmtBytes(bytes) : "";
   }, 250);
 
-  $("preview").srcObject = display;
+  $("preview").srcObject = attempt.display;
   $("preview").classList.remove("hidden");
   $("preview").muted = true;
+}
+
+// Releases an attempt's capture resources, re-enables Start recording and
+// reports the failure. Used by every cancelled or failed startup path.
+function startupFailed(attempt, message) {
+  if (attempt) {
+    for (const stream of [attempt.stream, attempt.display, attempt.mic]) {
+      stopAllTracks(stream);
+    }
+    if (attempt.audioContext) {
+      attempt.audioContext.close().catch(() => {});
+    }
+  }
+  starting = false;
+  $("startBtn").disabled = false;
+  setStatus("setupStatus", message, "error");
 }
 
 function stopAllTracks(stream) {
@@ -343,22 +389,32 @@ function stopRecording(manual) {
   if (!recorder || recorder.state === "inactive") return;
   pendingDurationMs = performance.now() - recordStart;
   clearInterval(timerHandle);
-  try { recorder.stop(); } catch { finishRecording(false, null); }
+  // If stop() throws the stop event may never come: finalize here. When it
+  // succeeds the stop event finalizes — exactly once, see below.
+  try { recorder.stop(); } catch { finalizeRecording(); }
 }
 
-// Assembles the blob and moves on to saving.
-function finishRecording(hadError, error) {
+// Runs exactly once per recording, from the stop event (or the failed-stop
+// fallback). An errored recording is finalized as a failure here, so the
+// final dataavailable that follows a recorder error can never be uploaded as
+// a successful clip afterwards.
+function finalizeRecording() {
+  if (!recorder) return;
+  const err = recorderError;
+  recorderError = null;
+  const mime = recorder.mimeType || pickMime();
+  recorder.ondataavailable = recorder.onerror = recorder.onstop = null;
+  recorder = null;
+
   clearInterval(timerHandle);
   $("preview").srcObject = null;
   $("preview").classList.add("hidden");
-  const mime = recorder ? recorder.mimeType : pickMime();
   releaseCapture();
-  recorder = null;
 
-  if (hadError) {
+  if (err) {
     chunks = [];
     show("setup");
-    setStatus("setupStatus", "Recording failed: " + (error && error.message ? error.message : "unknown recorder error") + ". Nothing was saved.", "error");
+    setStatus("setupStatus", "Recording failed: " + (err && err.message ? err.message : "unknown recorder error") + ". Nothing was saved.", "error");
     return;
   }
   if (!chunks.length) {

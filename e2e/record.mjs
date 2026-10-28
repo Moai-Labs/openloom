@@ -153,6 +153,23 @@ async function recordAClip(browser, title, opts = {}) {
   return result;
 }
 
+// Regression harness for the startup lifecycle guards. The real picker cannot
+// be scripted, so the capture entry points are replaced with manually
+// resolved promises; the guards themselves — the synchronous re-entry check,
+// the disabled Start button, the live-display-track verification and the
+// cleanup of a dead attempt — are the product code under test.
+const STARTUP_RACE_HARNESS = `
+  window.__race = { calls: [], gdm: null, um: null };
+  navigator.mediaDevices.getDisplayMedia = async () => {
+    window.__race.calls.push("display");
+    return new Promise((res, rej) => { window.__race.gdm = { res, rej }; });
+  };
+  navigator.mediaDevices.getUserMedia = async () => {
+    window.__race.calls.push("mic");
+    return new Promise((res) => { window.__race.um = { res }; });
+  };
+`;
+
 async function main() {
   await startServerIfLocal();
   const browser = await puppeteer.launch({ headless: true, args: BROWSER_FLAGS });
@@ -167,6 +184,9 @@ async function main() {
   const author = await recordAClip(browser, "E2E demo recording");
   check("recording produced a share link", /^http.*\/v\/[A-Za-z0-9_-]+$/.test(author.share), author.share);
   check("recording produced a manage link", author.manage.includes(author.share.split("/v/")[1]), author.manage);
+  console.log("INFO  recording used " + (author.usedSyntheticSource
+    ? "the synthetic capture source (the real picker did not open here)"
+    : "the real getDisplayMedia path"));
 
   // 1b. regression: Chrome's picker can supply display audio while the
   // microphone is also on — the two must be mixed into one track, recording
@@ -179,11 +199,111 @@ async function main() {
     /^http.*\/v\/[A-Za-z0-9_-]+$/.test(dual.share), dual.share);
   check("the dual-source clip contains audio", dual.hasAudio === true, String(dual.hasAudio));
 
+  // 1c. regression: repeated Start clicks during the asynchronous picker and
+  // permission flow must not start overlapping captures — the first click
+  // guards synchronously, disables the button, and later clicks are ignored.
+  const racePage = await browser.newPage();
+  await racePage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await racePage.evaluate(STARTUP_RACE_HARNESS);
+  await racePage.click("#startBtn");
+  await racePage.click("#startBtn");
+  await racePage.click("#startBtn");
+  const race = await racePage.evaluate(() => ({
+    calls: window.__race.calls,
+    startDisabled: document.getElementById("startBtn").disabled
+  }));
+  check("repeated Start clicks start exactly one capture flow",
+    race.calls.join("|") === "display", JSON.stringify(race.calls));
+  check("Start recording is disabled while startup is pending", race.startDisabled === true);
+
+  // 1d. regression: the user stops screen sharing while the microphone
+  // permission is still pending — the attempt must abort (no recording with
+  // an ended display track), release the microphone it was given, and
+  // re-enable Start recording.
+  await racePage.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320; canvas.height = 180;
+    const track = canvas.captureStream(10).getVideoTracks()[0];
+    track.stop(); // "Stop sharing" clicked while mic permission was pending
+    window.__race.gdm.res(new MediaStream([track]));
+  });
+  await racePage.evaluate(() => {
+    const ac = new AudioContext();
+    const dst = ac.createMediaStreamDestination();
+    const micStream = new MediaStream(dst.stream.getAudioTracks());
+    window.__race.micTrack = micStream.getAudioTracks()[0];
+    window.__race.um.res(micStream);
+  });
+  const aborted = await racePage.waitForFunction(
+    () => !document.getElementById("setup").classList.contains("hidden"),
+    { timeout: 5000 }
+  ).then(() => racePage.evaluate(() => ({
+    note: document.getElementById("setupStatus").textContent,
+    micTrack: window.__race.micTrack.readyState,
+    startEnabled: !document.getElementById("startBtn").disabled
+  })), () => null);
+  check("display capture ending during mic permission aborts startup",
+    !!aborted && /ended/i.test(aborted.note), aborted ? aborted.note : "no failure reported");
+  check("the pending attempt's microphone is released",
+    !!aborted && aborted.micTrack === "ended", aborted ? "mic track " + aborted.micTrack : "no outcome");
+  check("Start recording is enabled again after a failed attempt",
+    !!aborted && aborted.startEnabled === true);
+
+  // 1e. regression: finalization runs exactly once. Chrome dispatches an
+  // error event, then a final dataavailable, then stop — finalizing on the
+  // error used to save that trailing data as a "successful" clip. The page's
+  // MediaRecorder is wrapped so the sequence can be dispatched by hand.
+  await racePage.evaluate(() => {
+    const Real = window.MediaRecorder;
+    window.__madeRecorders = [];
+    window.MediaRecorder = class extends Real {
+      constructor(...args) { super(...args); window.__madeRecorders.push(this); }
+    };
+  });
+  await racePage.evaluate(STARTUP_RACE_HARNESS);
+  await racePage.click("#startBtn");
+  await racePage.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d");
+    let f = 0;
+    setInterval(() => { f++; ctx.fillRect(0, f % 180, 320, 2); }, 100);
+    window.__race.gdm.res(new MediaStream([canvas.captureStream(10).getVideoTracks()[0]]));
+  });
+  await racePage.evaluate(() => {
+    const ac = new AudioContext();
+    const dst = ac.createMediaStreamDestination();
+    window.__race.um.res(new MediaStream(dst.stream.getAudioTracks()));
+  });
+  await racePage.waitForSelector("#recording:not(.hidden)", { timeout: 5000 });
+  const clipsBefore = await racePage.evaluate(() => JSON.parse(localStorage.getItem("openloom.recordings") || "[]").length);
+  await racePage.evaluate(() => {
+    const rec = window.__madeRecorders[window.__madeRecorders.length - 1];
+    rec.onerror({ error: Object.assign(new Error("synthetic recorder failure"), { name: "SyntheticError" }) });
+    rec.ondataavailable({ data: new Blob(["trailing-data-after-error"], { type: "video/webm" }) });
+    rec.onstop();
+  });
+  const errored = await racePage.waitForFunction(
+    () => !document.getElementById("setup").classList.contains("hidden"),
+    { timeout: 5000 }
+  ).then(() => racePage.evaluate(() => ({
+    note: document.getElementById("setupStatus").textContent,
+    savedSection: !document.getElementById("result").classList.contains("hidden"),
+    clips: JSON.parse(localStorage.getItem("openloom.recordings") || "[]").length
+  })), () => null);
+  check("a recorder error finalizes exactly once, as a failure",
+    !!errored && /failed/i.test(errored.note), errored ? errored.note : "no failure reported");
+  check("trailing data after a recorder error is not uploaded as a clip",
+    !!errored && !errored.savedSection && errored.clips === clipsBefore,
+    errored ? `saved section shown=${errored.savedSection}, clips ${clipsBefore} -> ${errored.clips}` : "no outcome");
+
+  await racePage.close();
+
   // 2. a viewer without any cookies or storage opens the share link
   const viewerContext = await browser.createBrowserContext();
   const viewer = await viewerContext.newPage();
   await viewer.goto(author.share, { waitUntil: "networkidle0" });
-  const playback = await viewer.waitForFunction(() => {
+  const meta = await viewer.waitForFunction(() => {
     const v = document.querySelector("video");
     return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
   }, { timeout: 30000 }).then(async () => ({
@@ -191,8 +311,24 @@ async function main() {
     title: await viewer.evaluate(() => document.getElementById("clipTitle").textContent),
     deleteVisible: await viewer.evaluate(DELETE_VISIBLE, await viewer.$("#deleteBtn"))
   }), () => null);
-  check("share link plays for a viewer", !!playback, playback ? `${playback.duration.toFixed(1)}s, "${playback.title}"` : "video metadata never resolved");
-  if (playback) check("viewer does not see a delete button", !playback.deleteVisible);
+  check("share link resolves video metadata for a viewer", !!meta, meta ? `${meta.duration.toFixed(1)}s, "${meta.title}"` : "video metadata never resolved");
+  if (meta) check("viewer does not see a delete button", !meta.deleteVisible);
+
+  // 2b. metadata is not playback: start the video and require time to advance
+  // without a media error — this is what "plays for a viewer" means.
+  const played = await viewer.evaluate(async () => {
+    const v = document.querySelector("video");
+    v.muted = true;
+    try { await v.play(); } catch (err) { return { ok: false, why: "play() rejected: " + err.message }; }
+    const from = v.currentTime;
+    await new Promise((r) => setTimeout(r, 2000));
+    if (v.error) return { ok: false, why: "media error " + v.error.code + " (" + (v.error.message || "") + ")" };
+    return {
+      ok: !v.paused && !v.ended && v.currentTime > from,
+      why: `currentTime ${from.toFixed(2)}s -> ${v.currentTime.toFixed(2)}s, paused=${v.paused}, ended=${v.ended}`
+    };
+  });
+  check("video actually plays for the viewer", played.ok === true, played.why);
 
   // 3. the original downloads byte-identical
   const downloaded = await viewer.evaluate(async () => {

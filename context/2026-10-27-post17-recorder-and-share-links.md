@@ -121,3 +121,61 @@ headless Chrome needs hand-setup before `node e2e/record.mjs` will run:
    `<dir>`/usr/share/fonts, and run with `FONTCONFIG_PATH` set to it.
 5. CI does not need any of this: build.yml runs only `npm test` (the 13 API
    tests, no browser). The E2E is a dev-time gate before asking for a push.
+
+## Review round 2 changes (2026-10-28)
+
+- `public/recorder.html` — startup lifecycle races closed:
+  - `startRecording` guards re-entry synchronously (a `starting` flag checked
+    before the first await) and disables the Start button until the attempt
+    succeeds or fails, so repeated clicks during the picker/permission flow
+    cannot start overlapping captures.
+  - Each attempt's capture resources (display, mic, AudioContext, mixed
+    stream) stay in a local `attempt` object until the recording actually
+    starts; every cancelled or failed path releases exactly those via
+    `startupFailed`. Only a started recording is promoted to the shared
+    state.
+  - After the microphone permission resolves, the display video track's
+    `readyState` is verified live — stopping screen sharing while the mic
+    prompt is up aborts the attempt instead of handing an ended track to
+    MediaRecorder.
+  - Finalization runs exactly once per recorder: `onerror` only records
+    `recorderError`; the stop event drives `finalizeRecording()`, which
+    detaches the handlers and nulls `recorder` first. The final
+    dataavailable that follows a recorder error can therefore never be
+    uploaded as a "successful" clip after the failure UI is shown. The
+    failed-synchronous-stop path finalizes inline, guarded by the same
+    `if (!recorder) return`.
+- `e2e/record.mjs` — new checks (21 total, up from 13 at round 0):
+  - repeated Start clicks start exactly one capture flow and the button is
+    disabled while startup is pending (driven by a stubbed getDisplayMedia
+    whose promise the test resolves manually);
+  - display capture ending during the pending microphone permission aborts
+    startup with the failure note, releases the granted microphone track, and
+    re-enables the button;
+  - the error → dataavailable → stop sequence (dispatched by hand via a
+    wrapped MediaRecorder) ends in the failure UI, saves nothing, and leaves
+    the recordings list untouched;
+  - the viewer check now actually plays the clip: `video.play()` is awaited
+    and `currentTime` must advance with no `video.error`.
+
+## Verification status after round 2 (2026-10-28)
+
+- `npm test`: 16/16 pass (including "clips survive a fresh server generation
+  on the same data directory" — the container-replacement persistence check
+  at the server level).
+- `node e2e/record.mjs`: all 21 checks pass, stable across 3 runs.
+- Real screen capture: the main E2E recording used the **real
+  getDisplayMedia path** — headless Chrome honours
+  `--auto-select-desktop-capture-source=Entire screen`, so the capture is
+  genuine Chromium desktop capture of a screen source, encoded by
+  MediaRecorder, uploaded through the product. The microphone is the fake
+  device (this container has no physical mic), and the source is
+  auto-selected by flag rather than picked in the real picker dialog —
+  headless has no picker UI.
+- Still outstanding, by nature of this container (headless Linux, no GUI):
+  a human recording on the dev preview in real desktop Chrome through the
+  picker dialog, with a real screen and microphone. The preview URL for the
+  pushed head arrives with the CI verdict; the plan for the next session on
+  this post is to run this corrected E2E against the dev preview and record
+  the preview URL, playback, download, deletion and deployed-volume
+  persistence results here and in the post thread.
