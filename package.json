@@ -1,0 +1,13 @@
+{
+  "name": "openloom",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Screen recording you share with a link — no account needed to watch.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
