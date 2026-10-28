@@ -2,7 +2,7 @@
   "services": [
     {
       "name": "web",
-      "image": "ghcr.io/moai-labs/openloom",
+      "image": "registry.fly.io/fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d",
       "port": 3000,
       "cpus": 1,
       "memory_mb": 512,
