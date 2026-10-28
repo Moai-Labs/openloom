@@ -509,6 +509,125 @@ test("a laced block is measured through its frame count and the track default", 
   assert.equal(readWebmDurationMs(sane), 66);
 });
 
+// Feeds a file to a scanner `size` bytes at a time; Infinity pushes it whole.
+function pushedInChunks(buf, size) {
+  const scanner = new WebmDurationScanner();
+  if (size === Infinity) {
+    scanner.push(buf);
+    return scanner.end();
+  }
+  for (let i = 0; i < buf.length; i += size) {
+    scanner.push(buf.subarray(i, Math.min(i + size, buf.length)));
+  }
+  return scanner.end();
+}
+
+// Raw heads for tests that need deliberately malformed structure: the EBML
+// header, an unknown-size Segment, an Info with TimestampScale 1e6.
+function rawWebmHead() {
+  return Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x87, 0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40])
+  ]);
+}
+const CLUSTER_UNKNOWN = Buffer.from([0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+function clusterTimestamp(ms) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(ms, 0);
+  return Buffer.concat([Buffer.from([0xe7, 0x84]), b]);
+}
+// A Tracks element with one TrackEntry per {trackNumber, defaultNs}, built
+// apart from webmFile so a test can place it after the clusters.
+function tracksElement(entries) {
+  const body = Buffer.concat(entries.map(({ trackNumber, defaultNs }) => {
+    const durBody = Buffer.alloc(uintBodySize(defaultNs));
+    let v = defaultNs;
+    for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
+    const entryBody = Buffer.concat([
+      Buffer.from([0xd7, 0x81, trackNumber]),
+      Buffer.from([0x23, 0xe3, 0x83, 0x80 | durBody.length]), durBody
+    ]);
+    return Buffer.concat([Buffer.from([0xae, 0x80 | entryBody.length]), entryBody]);
+  }));
+  return Buffer.concat([Buffer.from([0x16, 0x54, 0xae, 0x6b, 0x80 | body.length]), body]);
+}
+
+test("Tracks arriving after blocks are refused — a late DefaultDuration must not measure blocks short", () => {
+  // a block at timestamp zero with no Tracks in sight reads as 0 ms; a
+  // ten-minute DefaultDuration declared behind it would then govern
+  // playback while the measured timeline stays at zero. The scanner never
+  // reconciles metadata that arrives late: the ordering itself is refused.
+  const base = webmFile({ spans: [[0, 0]] }); // Info + one block at ts 0, no Tracks
+  const late = Buffer.concat([base, tracksElement([{ trackNumber: 1, defaultNs: 600e9 }])]);
+  assert.equal(readWebmDurationMs(late), null);
+  for (const size of [4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(late, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a track that scales its own timestamps is refused, not silently skipped", () => {
+  // TrackTimestampScale changes how the track's blocks map onto the segment
+  // timeline — supported playback runs at a speed the measured timeline
+  // does not describe. The scanner cannot verify that clock, so the file is
+  // refused instead of reported at the default scale.
+  const scale = Buffer.alloc(8);
+  scale.writeDoubleBE(2, 0); // playback at half the measured speed
+  const tts = Buffer.concat([Buffer.from([0x23, 0x31, 0x4f, 0x80 | scale.length]), scale]);
+  const webm = webmFile({
+    tracks: [{ trackNumber: 1, defaultNs: 33e6, extraElements: [tts] }],
+    spans: [[0, 0]]
+  });
+  assert.equal(readWebmDurationMs(webm), null);
+  for (const size of [4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("a block whose body cannot hold its header is malformed even with the next element buffered", () => {
+  // the SimpleBlock declares a 2-byte body — one track byte plus one byte of
+  // what should be its timecode — and the next SimpleBlock's bytes sit
+  // directly behind it in the same buffer. Judging the header by what
+  // happens to be buffered would let a short block consume the element that
+  // follows; it is judged against the declared body instead.
+  const webm = Buffer.concat([
+    rawWebmHead(),
+    CLUSTER_UNKNOWN,
+    clusterTimestamp(0),
+    Buffer.from([0xa3, 0x82, 0x81, 0x00]), // declared body: 2 bytes, a header needs 4
+    // a 5 s block right behind it, complete with a 9-byte body, so the only
+    // defect in the file is the short block's own header
+    Buffer.from([0xa3, 0x89, 0x81, 0x13, 0x88, 0x00, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e])
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
+test("an unknown-size child cannot overrun the bounded parent that encloses it", () => {
+  // a known-size Segment holds an unknown-size Cluster whose SimpleBlock
+  // claims a body running past the Segment's end — and the file physically
+  // carries a Void behind that end, so this is invalid structure, not
+  // truncation. The block is judged against the Segment boundary even
+  // though its immediate parent (the cluster) has none.
+  const bodyBytes = 40;
+  const info = Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x87, 0x2a, 0xd7, 0xb1, 0x83, 0x0f, 0x42, 0x40]);
+  const block = Buffer.concat([Buffer.from([0xa3]), sizeVint(60), Buffer.alloc(60, 0x11)]);
+  const segmentSize = info.length + CLUSTER_UNKNOWN.length + clusterTimestamp(0).length + 2 + bodyBytes;
+  const webm = Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x87, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d]),
+    Buffer.from([0x18, 0x53, 0x80, 0x67]), sizeVint(segmentSize), // the Segment, size declared
+    info,
+    CLUSTER_UNKNOWN, // the cluster never declares a size
+    clusterTimestamp(0),
+    block, // its body runs 20 bytes past the Segment's declared end
+    Buffer.from([0xec, 0x81, 0x00]) // and a real element follows, past the boundary
+  ]);
+  for (const size of [Infinity, 4096, 64, 7, 3, 2, 1]) {
+    assert.equal(pushedInChunks(webm, size), null, `chunk size ${size}`);
+  }
+});
+
 test("a laced block whose track asserts no frame duration is refused", () => {
   const webm = webmFile({ laced: [{ clusterMs: 0, relMs: 0, frames: 2 }] });
   assert.equal(readWebmDurationMs(webm), null);
@@ -825,13 +944,14 @@ function webmFile({ spans = [], declaredDurationMs = null, padTo = 0, tracks = [
   parts.push(Buffer.from([0x15, 0x49, 0xa9, 0x66, 0x80 | infoBody.length]), infoBody);
   // Tracks: a TrackEntry per {trackNumber, defaultNs}, as a real muxer writes it
   if (tracks.length) {
-    const entries = tracks.map(({ trackNumber, defaultNs }) => {
+    const entries = tracks.map(({ trackNumber, defaultNs, extraElements = [] }) => {
       const durSize = uintBodySize(defaultNs);
       const durBody = Buffer.alloc(durSize);
       let v = defaultNs;
       for (let i = durBody.length - 1; i >= 0; i--) { durBody[i] = v & 0xff; v = Math.floor(v / 256); }
       const entryBody = Buffer.concat([
         Buffer.from([0xd7, 0x81, trackNumber]), // TrackNumber, one byte
+        ...extraElements,
         Buffer.from([0x23, 0xe3, 0x83, 0x80 | durBody.length]), durBody // DefaultDuration
       ]);
       return Buffer.concat([Buffer.from([0xae, 0x80 | entryBody.length]), entryBody]);
@@ -1141,8 +1261,6 @@ test("billing routes need an account", async () => {
 // writes used to let overlapping operations corrupt accounts.json and
 // invoices.json, and a rejected upload used to delete every other upload's
 // staging file with the shared tmp directory.
-
-const { Accounts } = require("../lib/accounts");
 
 test("concurrent account operations persist one consistent store", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openloom-acct-conc-"));
