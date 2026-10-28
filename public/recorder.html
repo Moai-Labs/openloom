@@ -410,6 +410,9 @@ function finalizeRecording() {
   $("preview").srcObject = null;
   $("preview").classList.add("hidden");
   releaseCapture();
+  // The recording is finalized and no startup is pending: Start recording is
+  // usable again on every path out of here — success, failure, empty.
+  $("startBtn").disabled = false;
 
   if (err) {
     chunks = [];
