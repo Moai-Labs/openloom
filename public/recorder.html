@@ -165,6 +165,9 @@ const MIME_CANDIDATES = [
 
 let recorder = null;
 let recordingStream = null;
+let displayStream = null;
+let micStream = null;
+let audioContext = null;
 let chunks = [];
 let recordStart = 0;
 let timerHandle = 0;
@@ -256,29 +259,54 @@ async function startRecording() {
     setStatus("setupStatus", "Microphone unavailable — recording with the captured audio only.", "");
   }
 
-  const tracks = [...display.getVideoTracks()];
-  const audioTracks = [...(mic ? mic.getAudioTracks() : []), ...display.getAudioTracks()];
-  recordingStream = new MediaStream([...tracks, ...audioTracks]);
+  displayStream = display;
+  micStream = mic;
+
+  // Chrome's picker can supply display audio while the microphone also came
+  // through — but MediaRecorder cannot record two audio tracks at once. Mix
+  // every audio source into a single track with Web Audio first.
+  const micTracks = mic ? [...mic.getAudioTracks()] : [];
+  const displayAudioTracks = [...display.getAudioTracks()];
+  let audioTrack = null;
+  if (micTracks.length + displayAudioTracks.length > 0) {
+    try {
+      audioContext = new AudioContext();
+      const mixed = audioContext.createMediaStreamDestination();
+      for (const t of micTracks) {
+        audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
+      }
+      for (const t of displayAudioTracks) {
+        audioContext.createMediaStreamSource(new MediaStream([t])).connect(mixed);
+      }
+      audioTrack = mixed.stream.getAudioTracks()[0] || null;
+    } catch {
+      // Mixing is a nicety; one source still beats not recording.
+      audioTrack = micTracks[0] || displayAudioTracks[0] || null;
+    }
+  }
+
+  recordingStream = new MediaStream([...display.getVideoTracks(), ...(audioTrack ? [audioTrack] : [])]);
 
   try {
     recorder = new MediaRecorder(recordingStream, { mimeType: mime, videoBitsPerSecond: 2_500_000 });
+
+    chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    recorder.onerror = (e) => finishRecording(true, e.error);
+    recorder.onstop = () => finishRecording(false, null);
+
+    // Chrome's "Stop sharing" button ends the video track: treat it as stop.
+    const videoTrack = display.getVideoTracks()[0];
+    if (videoTrack) videoTrack.addEventListener("ended", () => stopRecording(false), { once: true });
+
+    recordStart = performance.now();
+    recorder.start(1000);
   } catch (err) {
-    stopAllTracks();
+    recorder = null;
+    releaseCapture();
     setStatus("setupStatus", "Could not start the recorder: " + (err && err.message ? err.message : err), "error");
     return;
   }
-
-  chunks = [];
-  recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-  recorder.onerror = (e) => finishRecording(true, e.error);
-  recorder.onstop = () => finishRecording(false, null);
-
-  // Chrome's "Stop sharing" button ends the video track: treat it as stop.
-  const videoTrack = display.getVideoTracks()[0];
-  if (videoTrack) videoTrack.addEventListener("ended", () => stopRecording(false), { once: true });
-
-  recordStart = performance.now();
-  recorder.start(1000);
   pendingTitle = title;
 
   show("recording");
@@ -294,9 +322,21 @@ async function startRecording() {
   $("preview").muted = true;
 }
 
-function stopAllTracks() {
-  if (recordingStream) for (const t of recordingStream.getTracks()) t.stop();
-  if (recordingStream) recordingStream = null;
+function stopAllTracks(stream) {
+  if (stream) for (const t of stream.getTracks()) t.stop();
+}
+
+// Everything the recording borrowed — display, microphone, the mixing
+// context — is released together, on success and on failure alike.
+function releaseCapture() {
+  for (const stream of [recordingStream, displayStream, micStream]) {
+    stopAllTracks(stream);
+  }
+  recordingStream = displayStream = micStream = null;
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
 }
 
 function stopRecording(manual) {
@@ -312,7 +352,7 @@ function finishRecording(hadError, error) {
   $("preview").srcObject = null;
   $("preview").classList.add("hidden");
   const mime = recorder ? recorder.mimeType : pickMime();
-  stopAllTracks();
+  releaseCapture();
   recorder = null;
 
   if (hadError) {
