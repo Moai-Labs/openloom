@@ -192,6 +192,8 @@
 </main>
 <footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. Paid plan: $10/month for 2 GB via test USDC. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
 
+<!-- the webm Duration patch, shared verbatim with the server's tests -->
+<script src="/webm-patch.js"></script>
 <script>
 "use strict";
 
@@ -227,7 +229,14 @@ let pendingTitle = "";
 // blob (which cache it lands in, who sees its links) uses this, never
 // whatever account happens to be signed in when a response arrives
 let pendingOwnerEmail = null;
-let uploadXhr = null;
+// Identity of the save attempt that owns the pending state and the page.
+// Each saveRecording() run captures its own op object at entry, and every
+// callback checks it against `saveOp` before touching anything shared. A
+// newer attempt (a successor's recording, a retry) or a torn-down account
+// sets saveOp aside, and an older attempt's progress, completion and
+// failure callbacks then drop their result instead of clearing or
+// overwriting whatever the newer operation owns now.
+let saveOp = null;
 let autoStopped = false;
 // set while a sign-out or account switch tears a recording down: the
 // recorder's onstop then discards quietly instead of painting over the
@@ -320,21 +329,25 @@ function sessionChanged(tokenAtStart) {
   return token() !== tokenAtStart;
 }
 
-// The pending recording's fields alone, without touching what is on screen
-// now. Used by late save callbacks: at that point the departure has already
-// been cleaned up, and whatever the successor account is doing (an active
-// recording included) is not ours to stop.
-function discardPendingRecording() {
+// Clears the pending recording's fields — but only for the save attempt
+// that still owns them. A late callback of a superseded attempt passes its
+// own op, no longer matches, and clears nothing: the pending blob, title
+// and owner on the page belong to whoever recorded last.
+function discardPendingRecording(op) {
+  if (saveOp !== op) return;
   pendingBlob = null;
   pendingDurationMs = 0;
   pendingTitle = "";
   pendingOwnerEmail = null;
+  saveOp = null;
 }
 
 // Everything on the page that belongs to the departing account: its result
-// links, its pending recording, its preview. Pending save callbacks have
-// nothing left to restore or submit afterwards.
+// links, its pending recording, its preview. Pending save callbacks of the
+// departing attempt have nothing left to restore or submit afterwards —
+// dropping saveOp makes every one of them stale.
 function clearDepartedAccountState() {
+  saveOp = null;
   pendingBlob = null;
   pendingDurationMs = 0;
   pendingTitle = "";
@@ -529,6 +542,9 @@ async function startRecording() {
 
   recordStart = performance.now();
   autoStopped = false;
+  // a new recording supersedes any save still in flight: its callbacks must
+  // not clear or overwrite this one's pending state
+  saveOp = null;
   recorder.start(1000);
   pendingTitle = title;
   pendingOwnerEmail = storage(EMAIL_KEY, null); // the account this recording belongs to
@@ -613,101 +629,22 @@ function finishRecording(hadError, error) {
   saveRecording();
 }
 
-// --- webm duration patch -----------------------------------------------------
-
-// MediaRecorder writes the Segment and its Clusters with "unknown" (all-ones)
-// sizes and omits the Info.Duration element, so players cannot show a length.
-// The patch adds Duration by rebuilding only the Info element and copying
-// everything else byte-for-byte, so the uploaded file keeps the container
-// structure the server verifies. Returns null when the layout is unfamiliar.
-function webmVint(bytes, off, isId) {
-  if (off >= bytes.length) return null;
-  const first = bytes[off];
-  if (!first) return null;
-  let len = 1;
-  for (let mask = 0x80; !(first & mask); mask >>= 1) {
-    len++;
-    if (len > 8) return null;
-  }
-  if (off + len > bytes.length) return null;
-  const maskBits = 0xff >>> len;
-  let value = isId ? first : first & maskBits;
-  let allOnes = !isId && (first & maskBits) === maskBits;
-  for (let i = 1; i < len; i++) {
-    const b = bytes[off + i];
-    if (b !== 0xff) allOnes = false;
-    value = value * 256 + b;
-  }
-  return { value, len, unknown: allOnes };
-}
-
-// Children of a container region; null when it does not parse cleanly.
-function webmChildren(bytes, start, end) {
-  const out = [];
-  let pos = start;
-  while (pos < end) {
-    const id = webmVint(bytes, pos, true);
-    if (!id) return null;
-    const size = webmVint(bytes, pos + id.len, false);
-    if (!size) return null;
-    const bodyStart = pos + id.len + size.len;
-    if (bodyStart > end) return null;
-    const bodyEnd = size.unknown ? end : Math.min(bodyStart + size.value, end);
-    out.push({ id: id.value, start: pos, bodyStart, bodyEnd, next: bodyEnd });
-    if (size.unknown) return out; // nothing can be seen past an unknown-size element
-    pos = bodyEnd;
-  }
-  return out;
-}
-
-function webmSizeVint(value) {
-  let len = 1;
-  while (len < 8 && value > (1 << (7 * len)) - 2) len++;
-  const out = new Uint8Array(len);
-  out[0] = (0x80 | ((value >>> (8 * (len - 1))) & (0xff >>> len))) & 0xff;
-  for (let i = 1; i < len; i++) out[i] = (value >>> (8 * (len - 1 - i))) & 0xff;
-  return out;
-}
-
-async function patchWebmDuration(blob, durationMs) {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  const top = webmChildren(bytes, 0, bytes.length);
-  if (!top || top.length < 2) return null;
-  const ebml = top[0];
-  const segId = webmVint(bytes, ebml.next, true);
-  const segSize = segId && segId.value === 0x18538067 ? webmVint(bytes, ebml.next + segId.len, false) : null;
-  // only the head is rebuilt, so it must sit inside an unknown-size Segment
-  if (!segSize || !segSize.unknown) return null;
-  const kids = webmChildren(bytes, ebml.next + segId.len + segSize.len, bytes.length);
-  if (!kids) return null;
-  const info = kids.find((el) => el.id === 0x1549a966);
-  if (!info || info.next !== info.bodyEnd) return null;
-  const parts = webmChildren(bytes, info.bodyStart, info.bodyEnd);
-  if (!parts) return null;
-  let scale = 1000000;
-  const kept = [];
-  for (const part of parts) {
-    if (part.id === 0x4489) continue; // old Duration, replaced below
-    if (part.id === 0x2ad7b1 && part.bodyEnd - part.bodyStart <= 8) {
-      let v = 0;
-      for (let i = part.bodyStart; i < part.bodyEnd; i++) v = v * 256 + bytes[i];
-      if (v > 0) scale = v;
-    }
-    kept.push(bytes.slice(part.start, part.next));
-  }
-  const dur = new Uint8Array(11);
-  dur[0] = 0x44; dur[1] = 0x89; dur[2] = 0x88;
-  new DataView(dur.buffer).setFloat64(3, durationMs * 1000000 / scale);
-  const bodyLen = kept.reduce((n, p) => n + p.length, 0) + 11;
-  const out = [bytes.slice(0, info.start), new Uint8Array([0x15, 0x49, 0xa9, 0x66]), webmSizeVint(bodyLen), ...kept, dur, bytes.slice(info.next)];
-  return new Blob(out, { type: blob.type });
-}
-
 // --- saving ----------------------------------------------------------------
+
+// The webm Duration patch lives in /webm-patch.js, shared verbatim with the
+// server's tests: a patch the tests accept is the patch recordings get.
+const patchWebmDuration = self.OpenLoomWebmPatch.patchWebmDuration;
 
 async function saveRecording() {
   const blob = pendingBlob;
   if (!blob) return; // nothing pending: a retry after a discard or sign-out
+  // This attempt's own identity and captured state. Everything a callback
+  // needs comes from these locals — the shared pending fields belong to
+  // whichever save is current when the callback runs, which may be a
+  // successor's, not this one's.
+  const op = {};
+  saveOp = op;
+  const stale = () => saveOp !== op;
   const durationMs = Math.max(0, Math.round(pendingDurationMs));
   // The account that started this recording — not whichever one is signed in
   // when the response lands. An upload must never be submitted under, cached
@@ -732,41 +669,50 @@ async function saveRecording() {
       ])) || patched;
     } catch { /* keep the unpatched blob */ }
   }
-  pendingBlob = patched;
+  // the patch ran across an await: while it ran, a successor may have
+  // started recording, retried, or the account may have been signed out.
+  // The patched blob is stored only if this attempt still owns the page.
+  if (stale()) return;
 
   // an account switch while the (patching, upload) work was pending must not
   // submit the recording under the successor's session
   if (storage(EMAIL_KEY, null) !== ownerEmail) {
-    discardPendingRecording(); // never the successor's state — only the stale recording's fields
+    discardPendingRecording(op); // never the successor's state — only this attempt's fields
     setStatus("setupStatus", "The account changed since this recording was made — it was not submitted. Sign in as " + ownerEmail + " to save it.", "error");
     return;
   }
 
+  pendingBlob = patched;
   show("saving");
   setProgress(0);
 
   const xhr = new XMLHttpRequest();
-  uploadXhr = xhr;
   xhr.open("POST", "/api/clips");
   xhr.setRequestHeader("Content-Type", patched.type || "video/webm");
-  xhr.setRequestHeader("X-Title", encodeURIComponent(pendingTitle));
+  xhr.setRequestHeader("X-Title", encodeURIComponent(ownerTitle));
   xhr.setRequestHeader("X-Duration-Ms", String(durationMs));
   xhr.setRequestHeader("Authorization", "Bearer " + ownerToken);
   xhr.responseType = "json";
 
-  xhr.upload.onprogress = (e) => { if (e.lengthComputable) setProgress(e.loaded / e.total); };
+  xhr.upload.onprogress = (e) => {
+    if (!stale() && e.lengthComputable) setProgress(e.loaded / e.total);
+  };
   xhr.onload = () => {
-    uploadXhr = null;
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
+      // the clip exists and its key belongs in the owner's cache, whatever
+      // happened on the page since the upload was sent
+      rememberLocally(xhr.response, ownerEmail, ownerTitle);
+    }
+    if (stale()) return; // a newer attempt owns the page now: touch nothing of its
     // the response may arrive under a different account than the one that
     // submitted it: its links and key belong to the owner only
     const ownerChanged = storage(EMAIL_KEY, null) !== ownerEmail;
     if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
       const data = xhr.response;
-      rememberLocally(data, ownerEmail, ownerTitle);
       if (ownerChanged) {
         // the departure already cleaned up after itself; the successor's page
         // (an active recording included) must not be torn down by this callback
-        discardPendingRecording();
+        discardPendingRecording(op);
         setStatus("setupStatus", "The recording was saved to " + ownerEmail + " — you have changed accounts since, so its links are not shown here.", "");
         return;
       }
@@ -781,7 +727,7 @@ async function saveRecording() {
       show("result");
     } else if (ownerChanged) {
       // a failed response for the departed account never touches the new one
-      discardPendingRecording();
+      discardPendingRecording(op);
       setStatus("setupStatus", "The save for " + ownerEmail + " did not go through, and you have changed accounts since. Sign in as " + ownerEmail + " to try again.", "error");
     } else {
       const detail = xhr.response && xhr.response.error ? " (" + xhr.response.error + ")" : "";
@@ -798,11 +744,10 @@ async function saveRecording() {
     }
   };
   xhr.onerror = () => {
-    uploadXhr = null;
-    if (storage(EMAIL_KEY, null) !== ownerEmail) return; // the departed owner's failure is not the new account's business
+    if (stale()) return; // the departed attempt's failure is not the current one's business
     showSaveFailure("The save failed (network error). The recording is still here — you can retry.");
   };
-  xhr.onabort = () => { uploadXhr = null; };
+  xhr.onabort = () => { /* a retry or discard already moved the page on */ };
 
   xhr.send(patched);
 }
@@ -1001,6 +946,7 @@ let authMode = "signup";
 $("startBtn").onclick = startRecording;
 $("stopBtn").onclick = () => stopRecording(true);
 $("againBtn").onclick = () => {
+  saveOp = null; // any save still in flight no longer owns the page
   pendingBlob = null;
   $("title").value = "";
   show("setup");
@@ -1008,6 +954,7 @@ $("againBtn").onclick = () => {
 };
 $("retryBtn").onclick = () => saveRecording();
 $("discardBtn").onclick = () => {
+  saveOp = null; // any save still in flight no longer owns the page
   pendingBlob = null;
   show("setup");
   setStatus("setupStatus", "Discarded — nothing was saved.", "");

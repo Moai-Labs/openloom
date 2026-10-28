@@ -18,7 +18,7 @@
 // product path.
 
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import puppeteer from "puppeteer";
@@ -350,6 +350,122 @@ async function main() {
   }, "switchauthor@example.com", switchAuthorToken);
   check("the manage key from the switched upload lands in its owner's cache", ownerCacheHasIt);
   await switchPage.close();
+
+  // 4e. the successor records a clip while the departing owner's upload is
+  // still pending: the stale completion must not erase the successor's
+  // pending blob, title or owner, and the successor can still save,
+  // download and retry their own recording afterwards
+  const staleContext = await browser.createBrowserContext();
+  const stalePage = await staleContext.newPage();
+  const staleErrors = [];
+  stalePage.on("pageerror", (err) => staleErrors.push(err.message));
+  await stalePage.setRequestInterception(true);
+  let heldStaleUpload = null;
+  let releaseStaleUpload = null;
+  let failNextUpload = false;
+  const staleUploadHeld = new Promise((r) => { releaseStaleUpload = r; });
+  stalePage.on("request", (req) => {
+    if (!heldStaleUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      heldStaleUpload = req; // the departing owner's upload: held past the switch
+      releaseStaleUpload();
+      return;
+    }
+    if (failNextUpload && req.method() === "POST" && req.url().endsWith("/api/clips")) {
+      failNextUpload = false;
+      req.respond({ status: 500, body: '{"error":"stubbed failure"}', contentType: "application/json" });
+      return;
+    }
+    if (req.method() === "DELETE" && req.url().includes("/api/sessions/current")) {
+      // the sign-out call must not reach the server, so the departing session
+      // stays valid and the held upload can complete for its owner
+      req.respond({ status: 500 });
+      return;
+    }
+    req.continue();
+  });
+  await signUp(stalePage, "pendingowner@example.com");
+  const staleOwnerToken = await stalePage.evaluate(() => localStorage.getItem("openloom.token"));
+  await recordOnPage(stalePage, "Owner upload pending", 2500);
+  await withTimeout(staleUploadHeld, 30000, "the owner's upload request was never issued");
+
+  // the departure, then the successor on the same page
+  await stalePage.click("#signOutLink");
+  await stalePage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  await fill(stalePage, "#email", "afterpending@example.com");
+  await fill(stalePage, "#password", "correct horse battery");
+  await stalePage.click("#authBtn");
+  await stalePage.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+
+  // the successor records while the owner's upload is still held — no
+  // navigation in between, so the held request stays alive
+  await fill(stalePage, "#title", "Successor clip one");
+  await stalePage.click("#startBtn");
+  await stalePage.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  await new Promise((r) => setTimeout(r, 2500));
+  await stalePage.click("#stopBtn");
+  await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const successorShare = await stalePage.$eval("#shareLink", (el) => el.value);
+
+  // now the stale upload completes, under a page the successor owns
+  await heldStaleUpload.continue();
+  await new Promise((r) => setTimeout(r, 1000));
+  const afterStale = await stalePage.evaluate(() => ({
+    resultShown: !document.getElementById("result").classList.contains("hidden"),
+    share: document.getElementById("shareLink").value,
+    status: document.getElementById("setupStatus").textContent,
+    rows: document.querySelectorAll("#recList li").length
+  }));
+  check("a stale upload completion leaves the successor's saved result alone",
+    afterStale.resultShown && afterStale.share === successorShare
+      && !/changed accounts|did not go through/.test(afterStale.status)
+      && afterStale.rows === 1,
+    JSON.stringify(afterStale));
+  const staleOwnerClips = await (await fetch(baseUrl + "/api/my/clips", {
+    headers: { Authorization: "Bearer " + staleOwnerToken }
+  })).json();
+  check("the held upload still saved to the account that submitted it",
+    (staleOwnerClips.clips || []).length === 1, JSON.stringify((staleOwnerClips.clips || []).length));
+
+  // the successor's second recording: the save fails once (stubbed 500), so
+  // the failure screen offers download and retry on the successor's own blob
+  failNextUpload = true;
+  await fill(stalePage, "#title", "Successor clip two");
+  await stalePage.click("#startBtn");
+  await stalePage.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
+  await new Promise((r) => setTimeout(r, 2000));
+  await stalePage.click("#stopBtn");
+  await stalePage.waitForSelector("#failed:not(.hidden)", { timeout: 60000 });
+  check("a failed save shows the retry screen for the successor's own recording",
+    /Successor clip two|failed/i.test(await stalePage.$eval("#failNote", (el) => el.textContent)));
+
+  // download a copy of the successor's pending recording
+  const downloadDir = mkdtempSync(path.join(tmpdir(), "openloom-dl-"));
+  const cdp = await stalePage.createCDPSession();
+  await cdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloadDir });
+  await stalePage.click("#localBtn");
+  let downloaded = false;
+  for (let i = 0; i < 50 && !downloaded; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    downloaded = readdirSync(downloadDir).some((f) => f.startsWith("recording"));
+  }
+  check("the successor can download their own pending recording", downloaded,
+    JSON.stringify(readdirSync(downloadDir)));
+
+  // and the retry saves it
+  await stalePage.click("#retryBtn");
+  await stalePage.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
+  const retried = await stalePage.evaluate(() => ({
+    share: document.getElementById("shareLink").value,
+    rows: document.querySelectorAll("#recList li").length
+  }));
+  check("the successor can retry their own recording after a stale completion",
+    /^http.*\/v\/[A-Za-z0-9_-]+$/.test(retried.share) && retried.rows === 2,
+    JSON.stringify(retried));
+  check("no page errors through the stale-completion scenario", staleErrors.length === 0,
+    staleErrors.join(" | "));
+  rmSync(downloadDir, { recursive: true, force: true });
+  await stalePage.close();
 
   // 5. a viewer without any account opens a share link
   const viewerContext = await browser.createBrowserContext();
