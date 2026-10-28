@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenLoom — upgrade (test payment)</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --text: #e8eaf0; --muted: #9aa3b2; --accent: #5b8cff;
+    --ok: #4ade80; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6;
+  }
+  header {
+    display: flex; align-items: center; gap: .6rem;
+    padding: 1rem 1.25rem; border-bottom: 1px solid var(--line);
+  }
+  .logo { font-weight: 700; font-size: 1.15rem; text-decoration: none; color: var(--text); }
+  .logo span { color: var(--accent); }
+  main { max-width: 38rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .4rem; }
+  .sub { color: var(--muted); margin: 0 0 1.4rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 1.4rem; margin-bottom: 1.25rem;
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: .8rem 0 .25rem; }
+  input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: .6rem .75rem;
+    font: inherit; font-size: .85rem;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer; border-radius: 10px;
+    border: 1px solid var(--line); background: transparent; color: var(--text);
+    padding: .55rem 1rem; margin-top: .8rem;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; word-break: break-all; }
+  .copy {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: .6rem .75rem; margin: .25rem 0;
+  }
+  .muted { color: var(--muted); font-size: .9rem; }
+  .status { min-height: 1.2em; font-size: .9rem; margin: .6rem 0 0; }
+  .status.ok { color: var(--ok); }
+  .status.error { color: var(--err); }
+  .badge {
+    display: inline-block; font-size: .75rem; font-weight: 600; padding: .1rem .55rem;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--muted); vertical-align: middle;
+  }
+  .price { font-size: 1.6rem; font-weight: 700; }
+  .hidden { display: none; }
+  ol { margin: 0; padding-left: 1.2rem; }
+  ol li { margin: .4rem 0; }
+  footer { text-align: center; color: var(--muted); font-size: .8rem; padding: 1rem; }
+</style>
+</head>
+<body>
+<header><a class="logo" href="/">Open<span>Loom</span></a></header>
+<main>
+  <h1>Upgrade — 2 GB for $10/month</h1>
+  <p class="sub">Paid in <strong>test USDC</strong>. This is a <strong>test payment</strong>: test tokens have no value and no real money is charged.</p>
+
+  <section class="card" id="authCard">
+    <h2>Sign in first</h2>
+    <p class="muted">The paid plan belongs to your account. <a href="/" style="color:var(--accent)">Sign in on the recorder page</a>, then come back here.</p>
+    <p class="status" id="authStatus"></p>
+  </section>
+
+  <section class="card hidden" id="payCard">
+    <h2>The plan <span class="badge">test payment</span></h2>
+    <p class="price">$10 <span style="font-size:.9rem;color:var(--muted);font-weight:400">/ month via test USDC</span></p>
+    <ul style="color:var(--muted);font-size:.9rem;margin:.4rem 0 0;padding-left:1.2rem">
+      <li>2 GB of stored clips, up to 5 minutes and 100 MB per clip.</li>
+      <li>One payment of 10 test USDC covers 30 days, verified on-chain before the upgrade applies.</li>
+      <li>No real money: test USDC has no value.</li>
+    </ul>
+
+    <div id="requestStep">
+      <button class="primary" id="requestBtn">Get payment details</button>
+      <p class="status" id="requestStatus"></p>
+    </div>
+
+    <div id="payStep" class="hidden">
+      <h2 style="margin-top:1.2rem">Pay, then verify</h2>
+      <ol>
+        <li>Send exactly <strong id="amountOut"></strong> test USDC from any Base Sepolia wallet to:<div class="copy mono" id="payToOut"></div><button id="copyAddr" style="margin-top:.3rem">Copy address</button></li>
+        <li>Wait for the transaction to be mined.</li>
+        <li>Paste the transaction hash here and verify:<input type="text" id="txHash" class="mono" placeholder="0x…" autocomplete="off" spellcheck="false"><button class="primary" id="verifyBtn">Verify payment</button></li>
+      </ol>
+      <p class="status" id="verifyStatus"></p>
+      <p class="muted">This payment request expires in 24 hours; start a new one if it lapses.</p>
+    </div>
+  </section>
+
+  <section class="card hidden" id="doneCard">
+    <h2>You're on the paid plan</h2>
+    <p id="doneText"></p>
+    <p><a href="/" style="color:var(--accent)">Back to the recorder →</a></p>
+  </section>
+</main>
+<footer>OpenLoom — built in the open. Test payments on Base Sepolia; no real money moves.</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = "openloom.token";
+const token = () => localStorage.getItem(TOKEN_KEY) || "";
+let invoice = null;
+
+function setStatus(id, text, kind) {
+  const el = $(id);
+  el.textContent = text || "";
+  el.classList.toggle("ok", kind === "ok");
+  el.classList.toggle("error", kind === "error");
+}
+
+async function checkSignedIn() {
+  if (!token()) return false;
+  try {
+    const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+    if (res.status !== 200) return false;
+    const data = await res.json();
+    if (data.plan === "paid") {
+      $("doneCard").classList.remove("hidden");
+      $("payCard").classList.add("hidden");
+      $("authCard").classList.add("hidden");
+      const until = data.paidUntil ? new Date(data.paidUntil).toLocaleDateString() : "";
+      $("doneText").textContent = "2 GB of stored clips, until " + until + ". Paying again extends it by 30 days.";
+      return true;
+    }
+    return true; // signed in, on free
+  } catch {
+    return false;
+  }
+}
+
+$("requestBtn").addEventListener("click", async () => {
+  $("requestBtn").disabled = true;
+  setStatus("requestStatus", "Creating a payment request…");
+  try {
+    const res = await fetch("/api/billing/invoices", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status !== 201) {
+      setStatus("requestStatus", data.error || "Could not create a payment request (" + res.status + ").", "error");
+      $("requestBtn").disabled = false;
+      return;
+    }
+    invoice = data;
+    $("amountOut").textContent = data.amountUsdc + " USDC";
+    $("payToOut").textContent = data.payTo;
+    $("requestStep").classList.add("hidden");
+    $("payStep").classList.remove("hidden");
+    setStatus("requestStatus", "");
+  } catch {
+    setStatus("requestStatus", "Network error — try again.", "error");
+    $("requestBtn").disabled = false;
+  }
+});
+
+$("copyAddr").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(invoice.payTo); setStatus("requestStatus", "Address copied.", "ok"); }
+  catch { setStatus("requestStatus", "Copy failed — select the address text yourself.", "error"); }
+});
+
+$("verifyBtn").addEventListener("click", async () => {
+  const txHash = $("txHash").value.trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    setStatus("verifyStatus", "That does not look like a transaction hash — 0x followed by 64 hex characters.", "error");
+    return;
+  }
+  $("verifyBtn").disabled = true;
+  setStatus("verifyStatus", "Checking the chain for your payment…");
+  try {
+    const res = await fetch("/api/billing/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json", Authorization: "Bearer " + token() },
+      body: JSON.stringify({ invoiceId: invoice.invoiceId, txHash })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 200 && data.status === "paid") {
+      const until = data.paidUntil ? new Date(data.paidUntil).toLocaleDateString() : "";
+      $("payCard").classList.add("hidden");
+      $("doneCard").classList.remove("hidden");
+      $("doneText").textContent = "2 GB of stored clips, until " + until + ". Paying again extends it by 30 days.";
+      return;
+    }
+    setStatus("verifyStatus", data.error || "Could not verify (" + res.status + ").", "error");
+    $("verifyBtn").disabled = false;
+  } catch {
+    setStatus("verifyStatus", "Network error — try again.", "error");
+    $("verifyBtn").disabled = false;
+  }
+});
+
+(async () => {
+  const signed = await checkSignedIn();
+  if (signed) {
+    $("authCard").classList.add("hidden");
+    $("payCard").classList.remove("hidden");
+  }
+})();
+</script>
+</body>
+</html>

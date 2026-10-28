@@ -1,11 +1,20 @@
 #!/usr/bin/env node
-// End-to-end check in a real (headless) Chrome: record, upload, share-link
-// playback, download, and deletion. Run with the repo root as cwd:
+// End-to-end check in a real (headless) Chrome: sign up, record and save,
+// record another from the same page, stay usable after a recorder error,
+// survive the startup races, hit the free cap with a clear message, export,
+// play and download from a share link as a stranger, delete with the manage
+// key from a fresh session, and a full backup -> wipe -> restore -> playback
+// cycle on the server.
+//
+// Run with the repo root as cwd:
 //
 //   npm i puppeteer   # once, outside CI (downloads a Chrome)
 //   npm i yauzl       # needed where no `unzip` exists, to extract it
 //   node e2e/record.mjs [baseUrl]
 //
+// In a bare container the browser needs its shared libraries and at least one
+// font (via fontconfig): without a font the renderer dies on the first new
+// text render after a recording stops.
 // Without a baseUrl it starts the server itself on an ephemeral port with a
 // throwaway data directory. Headless Chrome has no screen to pick, so when the
 // real getDisplayMedia picker cannot open the script installs a synthetic
@@ -13,7 +22,7 @@
 // MediaRecorder encoding, upload, playback, download, deletion — is the real
 // product path.
 
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -41,11 +50,6 @@ async function startServerIfLocal() {
     child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
   });
 }
-
-// Rendered visibility, not a class name: the delete button must be styled
-// out of the page for viewers and actually shown for the manage key.
-const DELETE_VISIBLE = (el) =>
-  !!el && getComputedStyle(el).display !== "none" && el.getClientRects().length > 0;
 
 const BROWSER_FLAGS = [
   "--use-fake-ui-for-media-stream",
@@ -83,24 +87,53 @@ const FAKE_GET_DISPLAY_MEDIA = `
   };
 `;
 
-async function recordAClip(browser, title, opts = {}) {
-  const page = await browser.newPage();
-  let usedSyntheticSource = false;
+// Headless shells deliver clicks but not real keyboard events, so text goes
+// in as a value + input event — the same thing a password manager would do.
+async function fill(page, selector, value) {
+  await page.waitForSelector(selector, { timeout: 10000 });
+  await page.$eval(selector, (el, v) => {
+    el.value = v;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }, value);
+}
 
+async function signUp(page, email) {
+  await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await page.waitForSelector("#auth:not(.hidden)", { timeout: 10000 });
+  await fill(page, "#email", email);
+  await fill(page, "#password", "correct horse battery");
+  await page.click("#authBtn");
+  await page.waitForFunction(() =>
+    !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
+  return page.$eval("#whoami", (el) => el.textContent);
+}
+
+// Rendered visibility, not a class name: the delete button must be styled
+// out of the page for viewers and actually shown for the manage key.
+const DELETE_VISIBLE = (el) =>
+  !!el && getComputedStyle(el).display !== "none" && el.getClientRects().length > 0;
+
+// A studio page with the console watched for errors.
+async function openStudioPage(context) {
+  const page = await context.newPage();
   page.on("pageerror", (err) => console.error("  [pageerror]", err.message));
   page.on("console", (msg) => { if (msg.type() === "error") console.error("  [console.error]", msg.text()); });
   page.on("requestfailed", (r) => console.error("  [requestfailed]", r.url(), r.failure()?.errorText));
-
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
-  await page.type("#title", title);
+  return page;
+}
 
+// Drives one real recording on a page already on the studio: Start (with the
+// synthetic source pre-installed when asked), ~seconds of MediaRecorder
+// encoding, Stop and save.
+async function startRecordingOn(page, title, opts = {}) {
+  await fill(page, "#title", title);
   if (opts.forceSyntheticDisplay) {
-    // used for the display-audio + microphone regression: the synthetic
-    // source carries display audio, the fake device provides the microphone
+    // the synthetic source carries display audio; the fake device provides
+    // the microphone — both must be mixed into one track by the page
     await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
-    usedSyntheticSource = true;
   }
-
   await page.click("#startBtn");
   try {
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
@@ -108,18 +141,20 @@ async function recordAClip(browser, title, opts = {}) {
     if (opts.forceSyntheticDisplay) throw new Error("recording did not start with both audio sources");
     // headless Chrome often cannot open the real picker: inject a synthetic
     // capture source and record again
-    usedSyntheticSource = true;
     await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
     await page.click("#startBtn");
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
   }
+}
 
-  // record ~4 seconds of real MediaRecorder encoding
-  const mime = await page.evaluate(() => window.__mime || null);
-  await new Promise((r) => setTimeout(r, 4000));
+async function stopAndCollect(page, opts = {}) {
+  const seconds = opts.recordSeconds ?? 4;
+  await new Promise((r) => setTimeout(r, seconds * 1000));
   const timerText = await page.$eval("#timer", (el) => el.textContent);
-  if (!/0:0[34]/.test(timerText)) throw new Error(`timer looks wrong: ${timerText}`);
-
+  const lo = Math.floor(seconds), hi = lo + 1;
+  if (!new RegExp(`0:0[${lo}${hi}]$`).test(timerText)) {
+    throw new Error(`timer looks wrong: ${timerText}`);
+  }
   await page.click("#stopBtn");
   await page.waitForSelector("#result:not(.hidden)", { timeout: 60000 });
   const result = await page.evaluate(() => ({
@@ -133,7 +168,6 @@ async function recordAClip(browser, title, opts = {}) {
     const digest = await crypto.subtle.digest("SHA-256", buf);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   });
-  result.usedSyntheticSource = usedSyntheticSource;
   result.mime = await page.evaluate(() => (typeof pendingBlob !== "undefined" ? pendingBlob.type : ""));
   if (opts.expectAudio) {
     // the recorded clip must actually carry an audio track: decode it in the
@@ -149,7 +183,6 @@ async function recordAClip(browser, title, opts = {}) {
       } catch { return false; }
     });
   }
-  await page.close();
   return result;
 }
 
@@ -172,7 +205,7 @@ const STARTUP_RACE_HARNESS = `
 
 async function main() {
   await startServerIfLocal();
-  const browser = await puppeteer.launch({ headless: true, args: BROWSER_FLAGS });
+  const browser = await puppeteer.launch({ headless: "shell", args: BROWSER_FLAGS });
 
   const failures = [];
   const check = (name, ok, detail = "") => {
@@ -180,30 +213,39 @@ async function main() {
     if (!ok) failures.push(name);
   };
 
-  // 1. the author records and saves
-  const author = await recordAClip(browser, "E2E demo recording");
+  // 1. a new creator signs up
+  const authorContext = await browser.createBrowserContext();
+  const authorPage = await authorContext.newPage();
+  const who = await signUp(authorPage, "author@example.com");
+  check("new creator signs up and is signed in", who === "author@example.com", who);
+
+  // 2. same-page lifecycle regression: record and save a clip, select
+  // "Record another", and successfully start and save a second recording —
+  // Start recording must be usable again after a recording is finalized.
+  const flowPage = await openStudioPage(authorContext);
+  await startRecordingOn(flowPage, "E2E demo recording");
+  const author = await stopAndCollect(flowPage);
   check("recording produced a share link", /^http.*\/v\/[A-Za-z0-9_-]+$/.test(author.share), author.share);
   check("recording produced a manage link", author.manage.includes(author.share.split("/v/")[1]), author.manage);
-  console.log("INFO  recording used " + (author.usedSyntheticSource
-    ? "the synthetic capture source (the real picker did not open here)"
-    : "the real getDisplayMedia path"));
 
-  // 1b. regression: Chrome's picker can supply display audio while the
-  // microphone is also on — the two must be mixed into one track, recording
-  // must start, and the resulting clip must carry audio
-  const dual = await recordAClip(browser, "Dual audio regression", {
-    forceSyntheticDisplay: true,
-    expectAudio: true
-  });
-  check("recording starts with display audio and microphone together",
-    /^http.*\/v\/[A-Za-z0-9_-]+$/.test(dual.share), dual.share);
-  check("the dual-source clip contains audio", dual.hasAudio === true, String(dual.hasAudio));
+  await flowPage.waitForSelector("#againBtn", { timeout: 5000 });
+  await flowPage.click("#againBtn");
+  await flowPage.waitForSelector("#setup:not(.hidden)");
+  const startEnabled = await flowPage.evaluate(() => !document.getElementById("startBtn").disabled);
+  check("Record another returns to setup with Start enabled", startEnabled === true);
+  await startRecordingOn(flowPage, "Record another regression");
+  await new Promise((r) => setTimeout(r, 1000));
+  const secondTimer = await flowPage.$eval("#timer", (el) => el.textContent);
+  const second = await stopAndCollect(flowPage, { recordSeconds: 2 });
+  check("a second recording starts and runs after Record another",
+    /^0:0[123]$/.test(secondTimer), secondTimer);
+  check("the second recording saves its own clip",
+    /Saved/.test(second.note) && /^video\//.test(second.mime), `${second.note} (${second.mime})`);
 
-  // 1c. regression: repeated Start clicks during the asynchronous picker and
+  // 3. regression: repeated Start clicks during the asynchronous picker and
   // permission flow must not start overlapping captures — the first click
   // guards synchronously, disables the button, and later clicks are ignored.
-  const racePage = await browser.newPage();
-  await racePage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  const racePage = await openStudioPage(authorContext);
   await racePage.evaluate(STARTUP_RACE_HARNESS);
   await racePage.click("#startBtn");
   await racePage.click("#startBtn");
@@ -216,7 +258,7 @@ async function main() {
     race.calls.join("|") === "display", JSON.stringify(race.calls));
   check("Start recording is disabled while startup is pending", race.startDisabled === true);
 
-  // 1d. regression: the user stops screen sharing while the microphone
+  // 4. regression: the user stops screen sharing while the microphone
   // permission is still pending — the attempt must abort (no recording with
   // an ended display track), release the microphone it was given, and
   // re-enable Start recording.
@@ -227,6 +269,7 @@ async function main() {
     track.stop(); // "Stop sharing" clicked while mic permission was pending
     window.__race.gdm.res(new MediaStream([track]));
   });
+  await racePage.waitForFunction(() => window.__race && window.__race.um, { timeout: 5000 });
   await racePage.evaluate(() => {
     const ac = new AudioContext();
     const dst = ac.createMediaStreamDestination();
@@ -249,10 +292,11 @@ async function main() {
   check("Start recording is enabled again after a failed attempt",
     !!aborted && aborted.startEnabled === true);
 
-  // 1e. regression: finalization runs exactly once. Chrome dispatches an
-  // error event, then a final dataavailable, then stop — finalizing on the
-  // error used to save that trailing data as a "successful" clip. The page's
-  // MediaRecorder is wrapped so the sequence can be dispatched by hand.
+  // 5. regression: finalization runs exactly once, and a recorder error
+  // leaves a usable setup. Chrome dispatches an error event, then a final
+  // dataavailable, then stop — finalizing on the error used to save that
+  // trailing data as a "successful" clip. The page's MediaRecorder is wrapped
+  // so the sequence can be dispatched by hand.
   await racePage.evaluate(() => {
     const Real = window.MediaRecorder;
     window.__madeRecorders = [];
@@ -262,6 +306,9 @@ async function main() {
   });
   await racePage.evaluate(STARTUP_RACE_HARNESS);
   await racePage.click("#startBtn");
+  // the page checks the clip limit over HTTP before it reaches for the
+  // capture: wait for the harness promise to exist before resolving it
+  await racePage.waitForFunction(() => window.__race && window.__race.gdm, { timeout: 5000 });
   await racePage.evaluate(() => {
     const canvas = document.createElement("canvas");
     canvas.width = 320; canvas.height = 180;
@@ -270,6 +317,7 @@ async function main() {
     setInterval(() => { f++; ctx.fillRect(0, f % 180, 320, 2); }, 100);
     window.__race.gdm.res(new MediaStream([canvas.captureStream(10).getVideoTracks()[0]]));
   });
+  await racePage.waitForFunction(() => window.__race && window.__race.um, { timeout: 5000 });
   await racePage.evaluate(() => {
     const ac = new AudioContext();
     const dst = ac.createMediaStreamDestination();
@@ -284,25 +332,69 @@ async function main() {
     rec.onstop();
   });
   const errored = await racePage.waitForFunction(
-    () => !document.getElementById("setup").classList.contains("hidden"),
+    () => !document.getElementById("setup").classList.contains("hidden") &&
+      /failed/i.test(document.getElementById("setupStatus").textContent),
     { timeout: 5000 }
   ).then(() => racePage.evaluate(() => ({
-    note: document.getElementById("setupStatus").textContent,
     savedSection: !document.getElementById("result").classList.contains("hidden"),
+    startEnabled: !document.getElementById("startBtn").disabled,
     clips: JSON.parse(localStorage.getItem("openloom.recordings") || "[]").length
   })), () => null);
   check("a recorder error finalizes exactly once, as a failure",
-    !!errored && /failed/i.test(errored.note), errored ? errored.note : "no failure reported");
-  check("trailing data after a recorder error is not uploaded as a clip",
     !!errored && !errored.savedSection && errored.clips === clipsBefore,
     errored ? `saved section shown=${errored.savedSection}, clips ${clipsBefore} -> ${errored.clips}` : "no outcome");
+  check("Start recording is usable again after a recorder error",
+    !!errored && errored.startEnabled === true);
 
   await racePage.close();
+  await flowPage.close();
 
-  // 2. a viewer without any cookies or storage opens the share link
+  // 6. Chrome's picker can supply display audio while the microphone is also
+  // on — the two must be mixed into one track, recording must start, and the
+  // resulting clip must carry audio. This is the third and last free clip.
+  const dualPage = await openStudioPage(authorContext);
+  await startRecordingOn(dualPage, "Dual audio regression", { forceSyntheticDisplay: true });
+  const dual = await stopAndCollect(dualPage, { expectAudio: true });
+  check("recording starts with display audio and microphone together",
+    /^http.*\/v\/[A-Za-z0-9_-]+$/.test(dual.share), dual.share);
+  check("the dual-source clip contains audio", dual.hasAudio === true, String(dual.hasAudio));
+  await dualPage.close();
+
+  const shares = [author.share, second.share, dual.share];
+
+  // 7. the usage meter shows the account is full and the button says so
+  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  const fullState = await authorPage.waitForFunction(() => {
+    const bar = document.getElementById("usageBar");
+    return bar.classList.contains("full");
+  }, { timeout: 10000 }).then(() => authorPage.evaluate(() => ({
+    usageText: document.getElementById("usageText").textContent,
+    btn: document.getElementById("startBtn").textContent,
+    disabled: document.getElementById("startBtn").disabled,
+    listed: document.querySelectorAll("#recList li").length
+  })), () => null);
+  check("usage meter shows 3 of 3", !!fullState && /3 of 3/.test(fullState.usageText), fullState?.usageText);
+  check("start button names the limit and refuses to start",
+    !!fullState && fullState.disabled && /limit/i.test(fullState.btn),
+    fullState ? `${fullState.btn} (disabled=${fullState.disabled})` : "meter never filled");
+  check("the private clip list shows all three clips", !!fullState && fullState.listed === 3, String(fullState?.listed));
+
+  // 8. another account sees none of them
+  const strangerContext = await browser.createBrowserContext();
+  const stranger = await strangerContext.newPage();
+  const strangerEmail = await signUp(stranger, "stranger@example.com");
+  const strangerList = await stranger.waitForFunction(() =>
+    /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 })
+    .then(() => stranger.$eval("#recList", (ul) => ul.children.length));
+  check("a second account's list is private and empty", strangerEmail === "stranger@example.com" && strangerList === 0,
+    `${strangerEmail}, ${strangerList} rows`);
+
+  // 9. a viewer without any account opens a share link. Metadata is not
+  // playback: start the video and require time to advance without a media
+  // error — this is what "plays for a viewer" means.
   const viewerContext = await browser.createBrowserContext();
   const viewer = await viewerContext.newPage();
-  await viewer.goto(author.share, { waitUntil: "networkidle0" });
+  await viewer.goto(shares[0], { waitUntil: "networkidle0" });
   const meta = await viewer.waitForFunction(() => {
     const v = document.querySelector("video");
     return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
@@ -314,8 +406,6 @@ async function main() {
   check("share link resolves video metadata for a viewer", !!meta, meta ? `${meta.duration.toFixed(1)}s, "${meta.title}"` : "video metadata never resolved");
   if (meta) check("viewer does not see a delete button", !meta.deleteVisible);
 
-  // 2b. metadata is not playback: start the video and require time to advance
-  // without a media error — this is what "plays for a viewer" means.
   const played = await viewer.evaluate(async () => {
     const v = document.querySelector("video");
     v.muted = true;
@@ -330,7 +420,7 @@ async function main() {
   });
   check("video actually plays for the viewer", played.ok === true, played.why);
 
-  // 3. the original downloads byte-identical
+  // 10. the original downloads byte-identical
   const downloaded = await viewer.evaluate(async () => {
     const res = await fetch(document.getElementById("downloadBtn").href);
     const buf = await res.arrayBuffer();
@@ -349,7 +439,7 @@ async function main() {
     `${downloaded.bytes} bytes, hashes ${downloaded.hash === author.blobHash ? "match" : "differ"}`);
   check("download has an attachment filename", /attachment/.test(downloaded.disposition || ""), downloaded.disposition);
 
-  // 4. the manage link deletes from a completely different browser session
+  // 11. the manage link deletes from a completely different browser session
   const managerContext = await browser.createBrowserContext();
   const manager = await managerContext.newPage();
   await manager.goto(author.manage, { waitUntil: "networkidle0" });
@@ -365,18 +455,97 @@ async function main() {
     .then(() => check("manage link deletes the clip", true))
     .catch(() => check("manage link deletes the clip", false));
 
-  const after = await viewer.evaluate(async (url) => (await fetch(url)).status,
-    new URL(author.share).pathname.replace("/v/", "/api/clips/") );
-  check("clip is gone after deletion", after === 404, `meta now returns ${after}`);
+  const afterDelete = await viewer.evaluate(async (url) => (await fetch(url)).status,
+    new URL(shares[0]).pathname.replace("/v/", "/api/clips/"));
+  check("clip is gone after deletion", afterDelete === 404, `meta now returns ${afterDelete}`);
 
   // share link now explains itself (fresh page, plain load: the old tab's
   // media loader may keep retrying after the deletion and never go idle)
   const gonePage = await browser.newPage();
-  await gonePage.goto(author.share, { waitUntil: "domcontentloaded" });
+  await gonePage.goto(shares[0], { waitUntil: "domcontentloaded" });
   const gone = await gonePage.waitForFunction(() =>
     document.getElementById("note").textContent.length > 0, { timeout: 10000 })
     .then(() => gonePage.evaluate(() => document.getElementById("note").textContent));
   check("deleted share link explains itself", /deleted/i.test(gone), gone);
+
+  // 12. the export is one archive holding the manifest and the clips
+  const exported = await authorPage.evaluate(async () => {
+    const res = await fetch("/api/my/export", { method: "POST", headers: { Authorization: "Bearer " + localStorage.getItem("openloom.token") } });
+    if (!res.ok) return { ok: false, status: res.status };
+    const { exportPath } = await res.json();
+    const archive = await fetch(exportPath);
+    const buf = await archive.arrayBuffer();
+    const head = new TextDecoder().decode(new Uint8Array(buf.slice(0, 4096)));
+    return { ok: archive.status === 200, bytes: buf.byteLength, head, type: archive.headers.get("content-type") };
+  });
+  check("export downloads a tar archive", !!exported && exported.ok && /x-tar/.test(exported.type || ""),
+    exported ? `${exported.bytes} bytes` : "no archive");
+  check("export holds the manifest and both meta and video entries",
+    !!exported && /openloom-export\.json/.test(exported.head) && /clips\//.test(exported.head),
+    exported?.head?.slice(0, 60));
+
+  // 13. persistence: back up, wipe, restore — the clip list and files come back
+  let authorToken = null;
+  if (dataDir) {
+    const metaPath = new URL(shares[1]).pathname.replace("/v/", "/api/clips/");
+    const before = await (await fetch(baseUrl + metaPath)).json();
+    authorToken = await authorPage.evaluate(() => localStorage.getItem("openloom.token"));
+    const backupDir = dataDir + "-backups";
+    execFileSync(process.execPath, ["scripts/backup.mjs", "--dir", backupDir], {
+      cwd: REPO, env: { ...process.env, DATA_DIR: dataDir }, stdio: "inherit"
+    });
+    child.kill();
+    await new Promise((r) => setTimeout(r, 500));
+    rmSync(dataDir, { recursive: true, force: true }); // the disaster itself
+    execFileSync(process.execPath, ["scripts/restore.mjs", "--latest"], {
+      cwd: REPO, env: { ...process.env, DATA_DIR: dataDir, OPENLOOM_BACKUP_DIR: backupDir }, stdio: "inherit"
+    });
+    child = spawn(process.execPath, ["server.js"], {
+      cwd: REPO,
+      env: { ...process.env, PORT: "0", DATA_DIR: dataDir },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    const restarted = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("server did not restart")), 10000);
+      child.stdout.on("data", (d) => {
+        const match = /listening on (\d+)/.exec(String(d));
+        if (match) { clearTimeout(timer); resolve(`http://127.0.0.1:${match[1]}`); }
+      });
+      child.on("exit", (code) => reject(new Error(`server exited early (${code})`)));
+    });
+    baseUrl = restarted;
+    // the pages still sit on the pre-restart origin, so these go through node
+    const afterRes = await fetch(restarted + metaPath);
+    const after = { status: afterRes.status, body: afterRes.status === 200 ? await afterRes.json() : null };
+    check("a restored server serves the same clip",
+      after.status === 200 && after.body.bytes === before.bytes,
+      `status ${after.status}`);
+    const stillSignedIn = (await fetch(restarted + "/api/me", {
+      headers: { Authorization: "Bearer " + authorToken }
+    })).status;
+    check("accounts survive the restore too", stillSignedIn === 200, `me returned ${stillSignedIn}`);
+  } else {
+    // a remote deployment owns its own data dir; backup/restore is exercised
+    // by the local run, not by poking a shared dev stack
+    console.log("INFO  backup/restore skipped: a remote baseUrl was given");
+  }
+
+  // 14. delete everything — on the restarted server, still signed in
+  // (the restart moved ports, so the new origin gets the session back)
+  await authorPage.goto(baseUrl + "/", { waitUntil: "networkidle0" });
+  await authorPage.evaluate(([t, email]) => {
+    localStorage.setItem("openloom.token", t);
+    localStorage.setItem("openloom.email", email);
+  }, [authorToken, "author@example.com"]);
+  await authorPage.reload({ waitUntil: "networkidle0" });
+  await authorPage.waitForFunction(() => /of 3/.test(document.getElementById("usageText").textContent), { timeout: 10000 });
+  authorPage.on("dialog", (d) => d.accept());
+  await authorPage.click("#deleteAllBtn");
+  const emptied = await authorPage.waitForFunction(() =>
+    document.querySelectorAll("#recList li").length === 0, { timeout: 10000 }).then(() => true, () => false);
+  check("delete everything empties the list", emptied);
+  const goneAfterPurge = (await fetch(baseUrl + new URL(shares[1]).pathname.replace("/v/", "/api/clips/"))).status;
+  check("deleted clips stop playing for viewers", goneAfterPurge === 404, `meta now returns ${goneAfterPurge}`);
 
   await browser.close();
   if (child) child.kill();

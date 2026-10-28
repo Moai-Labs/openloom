@@ -179,3 +179,57 @@ headless Chrome needs hand-setup before `node e2e/record.mjs` will run:
   this post is to run this corrected E2E against the dev preview and record
   the preview URL, playback, download, deletion and deployed-volume
   persistence results here and in the post thread.
+
+## Merged origin/main into post-17 (2026-10-28)
+
+Main had moved on (post-18's free limits/accounts and post-19's paid plan were
+merged there), built from the same placeholder but evolved separately, so the
+merge was a reconciliation, not a fast-forward. What was taken from where:
+
+- **Taken from main wholesale**: `server.js`, `lib/accounts.js`,
+  `lib/payments.js`, `lib/keccak256.js`, `lib/tar.js`, `lib/webm-duration.js`,
+  `lib/store.js` (main's copy already contains the round-1 upload-cleanup
+  fixes, re-implemented there), `public/limits.html`, `public/upgrade.html`,
+  README, `backend/delivery-stamp.json`, `context/delivery-verify.json`.
+  `package-lock.json`/devDependencies (puppeteer, yauzl) stay from post-17.
+- **Kept from post-17**: `public/watch.html` — main's copy had lost the
+  `.hidden` CSS rule while the page still used the class, which made the
+  delete button visible to every viewer; post-17's round-1 fix is the real
+  rule. The Dockerfile keeps post-17's comment (deploy.json — identical on
+  both branches — mounts the 5 GB volume at /data and sets DATA_DIR=/data;
+  the Dockerfile's /app/data is only the in-container fallback).
+- **Reconciled by hand**:
+  - `public/recorder.html` — main's accounts/usage-meter/free-limit features
+    combined with post-17's reviewed lifecycle work: the synchronous re-entry
+    guard, per-attempt capture cleanup (`startupFailed`/`releaseCapture`),
+    the live-display-track check after the mic permission, Web Audio mixing
+    of display audio + microphone, single finalization via `finalizeRecording`,
+    and the round-3 re-enable of Start on every finalize path. `renderUsage`
+    now respects a pending startup (`starting`) so an account refresh cannot
+    re-enable the button mid-attempt; the free-limit gate keeps the button
+    disabled and relabelled when the meter is full.
+  - `e2e/record.mjs` — one combined flow: sign-up, the round-3 same-page
+    regression (record → save → Record another → second recording saves),
+    the startup-race checks, the exactly-once-finalization check extended
+    with "Start is usable again after a recorder error", the dual-audio clip,
+    main's free-limit/privacy/export/backup-restore checks, and post-17's
+    viewer checks (real playback assertion, byte-identical download,
+    manage-key deletion from a fresh session, rendered delete-button
+    visibility). The backup/restore section now reports skipped-by-design on
+    a remote baseUrl instead of failing the run.
+  - `test/server.test.js` — auto-merged; post-17's three upload tests were
+    ported to the account model (bearer session on every upload, clip-count
+    assertions scoped to this test's own clip, `Store.remove(id, { token })`
+    signature).
+
+## Review round 3 changes (2026-10-28)
+
+- `public/recorder.html`: `finalizeRecording` re-enables Start recording now
+  that the recording is finalized and no startup is pending — on the success,
+  recorder-error and empty-recording paths alike; the cancelled/failed startup
+  paths already re-enabled it via `startupFailed`. Same-page E2E regression:
+  record and save a clip, click "Record another", and successfully start and
+  save a second recording; plus "Start recording is usable again after a
+  recorder error" on the exactly-once error path.
+- Dev-preview verification — see "Dev preview and deployment verification"
+  below.

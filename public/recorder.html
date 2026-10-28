@@ -19,9 +19,13 @@
     display: flex; align-items: center; gap: .6rem;
     padding: 1rem 1.25rem; border-bottom: 1px solid var(--line);
   }
-  .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: .01em; }
+  .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: .01em; text-decoration: none; color: var(--text); }
   .logo span { color: var(--accent); }
   header .tag { color: var(--muted); font-size: .85rem; }
+  header .spacer { margin-left: auto; }
+  header .whoami { color: var(--muted); font-size: .85rem; }
+  header a.plain { color: var(--accent); text-decoration: none; font-size: .85rem; cursor: pointer; }
+  header a.plain:hover { text-decoration: underline; }
   main { max-width: 42rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -30,7 +34,7 @@
   h1 { font-size: 1.5rem; margin: 0 0 .35rem; }
   .sub { color: var(--muted); margin: 0 0 1.2rem; }
   label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3rem; }
-  input[type="text"] {
+  input[type="text"], input[type="email"], input[type="password"] {
     width: 100%; padding: .6rem .75rem; border-radius: 8px; border: 1px solid var(--line);
     background: var(--bg); color: var(--text); font-size: 1rem; margin-bottom: 1rem;
   }
@@ -48,6 +52,10 @@
   .status { margin-top: 1rem; color: var(--muted); font-size: .95rem; }
   .status.error { color: var(--danger); }
   .status.ok { color: var(--ok); }
+  .usage { display: flex; align-items: center; gap: .6rem; margin: 0 0 1rem; font-size: .85rem; color: var(--muted); }
+  .meter { flex: 1; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  .meter > div.full { background: var(--danger); }
   .timer { font-variant-numeric: tabular-nums; font-size: 1.4rem; font-weight: 700; }
   .recdot { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; background: var(--danger); margin-right: .45rem; animation: blink 1.2s infinite; }
   @keyframes blink { 50% { opacity: .25; } }
@@ -74,18 +82,44 @@
   ul.recordings .del { margin-left: auto; }
   .empty { color: var(--muted); font-size: .9rem; }
   .hidden { display: none !important; }
+  .authswitch { font-size: .85rem; color: var(--muted); }
+  .authswitch a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .bulk { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
+  .bulk button { font-size: .85rem; padding: .5rem .9rem; }
   footer { text-align: center; color: var(--muted); font-size: .8rem; padding: 1rem; }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">Open<span>Loom</span></div>
+  <a class="logo" href="/">Open<span>Loom</span></a>
   <div class="tag">record your screen, share a link — no account needed to watch</div>
+  <div class="spacer"></div>
+  <span class="whoami hidden" id="whoami"></span>
+  <a class="plain" id="signOutLink">Sign out</a>
+  <a class="plain" id="signInLink">Sign in</a>
 </header>
 <main>
+  <section class="card hidden" id="auth">
+    <h1 id="authTitle" style="font-size:1.1rem">Sign up — it's free</h1>
+    <p class="sub" id="authSub">An account keeps your clip list private to you. Watching a share link never needs one.</p>
+    <label for="email">Email</label>
+    <input type="email" id="email" maxlength="200" autocomplete="email">
+    <label for="password">Password (8+ characters)</label>
+    <input type="password" id="password" maxlength="200" autocomplete="current-password">
+    <button class="primary" id="authBtn">Create account</button>
+    <p class="status" id="authStatus"></p>
+    <p class="authswitch" id="authSwitch">Already recording here? <a id="authToggle">Sign in</a></p>
+  </section>
+
   <section class="card" id="studio">
     <h1>Record your screen</h1>
     <p class="sub">Desktop Chrome. You pick the screen, window or tab; your microphone is added when you allow it.</p>
+
+    <div class="usage" id="usage">
+      <span id="usageText"></span>
+      <div class="meter"><div id="usageBar"></div></div>
+      <a href="/upgrade" id="upgradeLink" class="hidden" style="color:var(--accent);white-space:nowrap">Upgrade</a>
+    </div>
 
     <div id="setup">
       <label for="title">Title (optional)</label>
@@ -118,7 +152,7 @@
           <button class="ghost" data-copy="manageLink">Copy</button>
         </div>
       </div>
-      <p class="hint">The share link plays for anyone. The manage link also allows deleting the clip — keep it, it is the only key.</p>
+      <p class="hint">The share link plays for anyone. The manage link also allows deleting the clip — keep it, it works even signed out.</p>
       <p>
         <a id="openShare" href="#"><button class="primary">Open the share page</button></a>
         <button class="ghost" id="againBtn">Record another</button>
@@ -137,14 +171,26 @@
     <video id="preview" class="preview hidden" controls playsinline></video>
   </section>
 
-  <section class="card">
-    <h1 style="font-size:1.1rem">Recorded on this device</h1>
-    <p class="sub">Saved in this browser only — clearing site data forgets the list (the clips themselves stay until deleted).</p>
+  <section class="card" id="clipsCard">
+    <h1 style="font-size:1.1rem">Your clips</h1>
+    <p class="sub">Private to your account. Share links stay open to anyone you send them to.</p>
     <ul class="recordings" id="recList"></ul>
     <p class="empty" id="recEmpty">Nothing yet. Your first recording appears here with its links.</p>
+    <div class="bulk" id="bulkActions">
+      <button class="ghost" id="exportBtn">Export everything (.tar)</button>
+      <button class="danger" id="deleteAllBtn">Delete everything</button>
+    </div>
+    <p class="hint"><a href="#" id="deleteAccountLink" style="color:var(--muted)">Delete your account</a> — removes the account and every clip.</p>
+  </section>
+
+  <section class="card hidden" id="deviceCard">
+    <h1 style="font-size:1.1rem">Recorded on this device</h1>
+    <p class="sub">Made before you signed in on this browser — saved in this browser only.</p>
+    <ul class="recordings" id="deviceList"></ul>
+    <p class="empty" id="deviceEmpty">Nothing here.</p>
   </section>
 </main>
-<footer>OpenLoom — built in the open.</footer>
+<footer>OpenLoom — built in the open. Free plan: 3 stored clips, up to 5 minutes and 100 MB each. Paid plan: $10/month for 2 GB via test USDC. <a href="/limits" style="color:inherit">Limits &amp; pricing</a>.</footer>
 
 <script src="/vendor/fix-webm-duration.js"></script>
 <script>
@@ -152,6 +198,8 @@
 
 const $ = (id) => document.getElementById(id);
 const STORE_KEY = "openloom.recordings";
+const TOKEN_KEY = "openloom.token";
+const EMAIL_KEY = "openloom.email";
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 
 const MIME_CANDIDATES = [
@@ -163,6 +211,7 @@ const MIME_CANDIDATES = [
 
 // --- state ---------------------------------------------------------------
 
+let limits = { maxClips: 3, maxDurationMs: 300000, maxClipBytes: 104857600 };
 let recorder = null;        // the active MediaRecorder (set only once started)
 let recorderError = null;   // set by onerror; finalization runs once, from stop
 let recordingStream = null;
@@ -177,6 +226,7 @@ let pendingBlob = null;
 let pendingDurationMs = 0;
 let pendingTitle = "";
 let uploadXhr = null;
+let autoStopped = false;
 
 // --- tiny helpers ---------------------------------------------------------
 
@@ -186,6 +236,12 @@ function storage(key, fallback) {
 function storageSet(key, value) {
   try { window.localStorage.setItem(key, value); } catch { /* private mode etc. */ }
 }
+function storageRemove(key) {
+  try { window.localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+function token() { return storage(TOKEN_KEY, null); }
+function signedIn() { return !!token(); }
 
 function loadRecordings() {
   try { return JSON.parse(storage(STORE_KEY, "[]")) || []; } catch { return []; }
@@ -222,6 +278,91 @@ function pickMime() {
   return MIME_CANDIDATES.find((t) => MediaRecorder.isTypeSupported(t)) || null;
 }
 
+// --- account --------------------------------------------------------------
+
+async function refreshAccount() {
+  const signed = signedIn();
+  $("signInLink").classList.toggle("hidden", signed);
+  $("signOutLink").classList.toggle("hidden", !signed);
+  $("auth").classList.toggle("hidden", signed || authCardPinned);
+  $("clipsCard").classList.toggle("hidden", !signed);
+  $("deviceCard").classList.toggle("hidden", signed || loadRecordings().length === 0);
+  $("whoami").classList.toggle("hidden", !signed);
+  if (signed) {
+    $("whoami").textContent = storage(EMAIL_KEY, "");
+    $("authStatus").textContent = "";
+    try {
+      const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+      if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+      const data = await res.json();
+      renderUsage(data.usage, data.limits);
+      if (data.limits) limits = data.limits;
+      await renderServerClips();
+    } catch {
+      renderUsage(null, null);
+    }
+  } else {
+    renderUsage(null, null);
+    renderDeviceRecordings();
+  }
+}
+
+let authCardPinned = false;
+
+function renderUsage(usage, serverLimits) {
+  if (serverLimits) limits = serverLimits;
+  const cap = limits.maxClips;
+  const used = usage ? usage.clips : 0;
+  const full = used >= cap;
+  const paid = limits.tier === "paid";
+  $("upgradeLink").classList.toggle("hidden", paid || !signedIn());
+  $("usageText").textContent = signedIn()
+    ? `${paid ? "Paid plan" : "Free plan"} — ${used} of ${cap} clips`
+    : `Free plan — ${cap} clips, up to ${Math.round(limits.maxDurationMs / 60000)} minutes and ${fmtBytes(limits.maxClipBytes)} each`;
+  const bar = $("usageBar");
+  bar.style.width = Math.min(100, (used / cap) * 100) + "%";
+  bar.classList.toggle("full", full);
+  // A pending startup keeps its hold on the button; renderUsage runs on every
+  // account refresh and must not re-enable it mid-attempt.
+  $("startBtn").disabled = starting || (signedIn() && full);
+  $("startBtn").textContent = !signedIn() ? "Start recording"
+    : full ? "Free limit reached" : "Start recording";
+}
+
+async function submitAuth(mode) {
+  const email = $("email").value.trim();
+  const password = $("password").value;
+  try {
+    const res = await fetch(mode === "signup" ? "/api/accounts" : "/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 200 || res.status === 201) {
+      storageSet(TOKEN_KEY, data.token);
+      storageSet(EMAIL_KEY, data.email);
+      authCardPinned = false;
+      $("password").value = "";
+      setStatus("setupStatus", "Signed in as " + data.email + ". You can record.", "ok");
+      await refreshAccount();
+    } else {
+      setStatus("authStatus", data.error || "That did not work (" + res.status + ").", "error");
+    }
+  } catch {
+    setStatus("authStatus", "Network error — try again.", "error");
+  }
+}
+
+function signOut(message) {
+  const t = token();
+  if (t) fetch("/api/sessions/current", { method: "DELETE", headers: { Authorization: "Bearer " + t } }).catch(() => {});
+  storageRemove(TOKEN_KEY);
+  storageRemove(EMAIL_KEY);
+  if (message) setStatus("setupStatus", message, "error");
+  refreshAccount();
+}
+
 // --- recording ------------------------------------------------------------
 
 async function startRecording() {
@@ -231,6 +372,23 @@ async function startRecording() {
   starting = true;
   $("startBtn").disabled = true;
 
+  if (!signedIn()) {
+    starting = false;
+    $("startBtn").disabled = false;
+    authCardPinned = true;
+    $("auth").classList.remove("hidden");
+    $("auth").scrollIntoView({ behavior: "smooth", block: "start" });
+    setStatus("authStatus", "Create a free account (or sign in) to record — it keeps your clip list private to you.", "");
+    return;
+  }
+  if (await overClipLimit()) {
+    // renderUsage has relabelled the button for the full meter; leave it
+    // disabled and explain the limit.
+    starting = false;
+    setStatus("setupStatus",
+      `You have used all ${limits.maxClips} free clips. Delete one from “Your clips” below to record another.`, "error");
+    return;
+  }
   const mime = pickMime();
   if (!mime) {
     startupFailed(null, "This browser cannot record video (MediaRecorder missing). Desktop Chrome is supported.");
@@ -338,18 +496,40 @@ async function startRecording() {
   pendingTitle = $("title").value.trim();
   recordStart = performance.now();
   starting = false;
+  autoStopped = false;
 
   show("recording");
+  $("timer").textContent = "0:00";
   timerHandle = setInterval(() => {
     const ms = performance.now() - recordStart;
     $("timer").textContent = fmtClock(ms);
     const bytes = chunks.reduce((n, c) => n + c.size, 0);
     $("sizeNote").textContent = bytes > 1024 ? " · " + fmtBytes(bytes) : "";
+    // stop just before the free cap so the recording still saves
+    if (!autoStopped && ms >= limits.maxDurationMs) {
+      autoStopped = true;
+      stopRecording(false);
+      setStatus("setupStatus", `Stopped at the free ${Math.round(limits.maxDurationMs / 60000)}-minute limit — saving what you have.`, "");
+    }
   }, 250);
 
   $("preview").srcObject = attempt.display;
   $("preview").classList.remove("hidden");
   $("preview").muted = true;
+}
+
+// The server enforces the cap too; this saves a wasted recording.
+async function overClipLimit() {
+  try {
+    const res = await fetch("/api/me", { headers: { Authorization: "Bearer " + token() } });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data.limits) limits = data.limits;
+    renderUsage(data.usage, data.limits);
+    return data.usage && data.usage.clips >= limits.maxClips;
+  } catch {
+    return false;
+  }
 }
 
 // Releases an attempt's capture resources, re-enables Start recording and
@@ -458,6 +638,7 @@ async function saveRecording() {
   xhr.setRequestHeader("Content-Type", blob.type || "video/webm");
   xhr.setRequestHeader("X-Title", encodeURIComponent(pendingTitle));
   xhr.setRequestHeader("X-Duration-Ms", String(durationMs));
+  xhr.setRequestHeader("Authorization", "Bearer " + token());
   xhr.responseType = "json";
 
   xhr.upload.onprogress = (e) => { if (e.lengthComputable) setProgress(e.loaded / e.total); };
@@ -465,13 +646,8 @@ async function saveRecording() {
     uploadXhr = null;
     if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.id) {
       const data = xhr.response;
-      const list = loadRecordings();
-      list.unshift({
-        id: data.id, token: data.manageToken, title: pendingTitle || null,
-        bytes: data.bytes, createdAt: data.createdAt
-      });
-      saveRecordings(list);
-      renderRecordings();
+      rememberLocally(data);
+      renderServerClips();
 
       const url = new URL(location.href);
       url.hash = "";
@@ -482,7 +658,14 @@ async function saveRecording() {
       show("result");
     } else {
       const detail = xhr.response && xhr.response.error ? " (" + xhr.response.error + ")" : "";
-      showSaveFailure("The save failed" + detail + ". The recording is still here — you can retry.");
+      if (xhr.status === 401) {
+        showSaveFailure("Your session expired — sign in again to save. " + detail);
+        signOut();
+      } else if (xhr.status === 403 || xhr.status === 413) {
+        showSaveFailure("Nothing was saved. " + (xhr.response && xhr.response.error ? xhr.response.error : "The save was refused.") + " Your recording is still here — download a copy or delete a clip and retry.");
+      } else {
+        showSaveFailure("The save failed" + detail + ". The recording is still here — you can retry.");
+      }
     }
   };
   xhr.onerror = () => {
@@ -492,6 +675,17 @@ async function saveRecording() {
   xhr.onabort = () => { uploadXhr = null; };
 
   xhr.send(blob);
+}
+
+// The manage key is kept on this device as well: it deletes the clip even
+// signed out, and the account list covers everything else.
+function rememberLocally(data) {
+  const list = loadRecordings();
+  list.unshift({
+    id: data.id, token: data.manageToken, title: pendingTitle || null,
+    bytes: data.bytes, createdAt: data.createdAt
+  });
+  saveRecordings(list);
 }
 
 function setProgress(fraction) {
@@ -505,56 +699,80 @@ function showSaveFailure(message) {
   setStatus("failNote", message, "error");
 }
 
-// --- recordings list -------------------------------------------------------
+// --- lists -----------------------------------------------------------------
 
-function renderRecordings() {
-  const list = loadRecordings();
-  $("recEmpty").classList.toggle("hidden", list.length > 0);
+async function renderServerClips() {
+  let clips = [];
+  try {
+    const res = await fetch("/api/my/clips", { headers: { Authorization: "Bearer " + token() } });
+    if (res.status === 401) { signOut("Your session expired — sign in again."); return; }
+    clips = (await res.json()).clips || [];
+  } catch { return; }
+  const tokens = new Map(loadRecordings().map((r) => [r.id, r.token]));
   const ul = $("recList");
   ul.textContent = "";
-  for (const rec of list) {
-    const li = document.createElement("li");
-
-    const title = document.createElement("span");
-    title.className = "rtitle";
-    title.textContent = rec.title || "Untitled recording";
-    li.appendChild(title);
-
-    const meta = document.createElement("span");
-    meta.className = "rmeta";
-    meta.textContent = new Date(rec.createdAt).toLocaleString() + " · " + fmtBytes(rec.bytes);
-    li.appendChild(meta);
-
-    const watch = document.createElement("a");
-    watch.href = "/v/" + rec.id;
-    watch.textContent = "share";
-    li.appendChild(watch);
-
-    const manage = document.createElement("a");
-    manage.href = "/v/" + rec.id + "?k=" + encodeURIComponent(rec.token);
-    manage.textContent = "manage";
-    li.appendChild(manage);
-
-    const del = document.createElement("button");
-    del.className = "danger del";
-    del.textContent = "Delete";
-    del.onclick = () => deleteFromList(rec, li);
-    li.appendChild(del);
-
-    ul.appendChild(li);
+  $("recEmpty").classList.toggle("hidden", clips.length > 0);
+  for (const clip of clips) {
+    ul.appendChild(clipRow({
+      id: clip.id, token: tokens.get(clip.id), title: clip.title,
+      bytes: clip.bytes, createdAt: clip.createdAt
+    }, () => renderServerClips()));
   }
+  renderUsage({ clips: clips.length, bytes: clips.reduce((n, c) => n + (c.bytes || 0), 0) }, limits);
 }
 
-async function deleteFromList(rec, li) {
+function renderDeviceRecordings() {
+  const list = loadRecordings();
+  $("deviceEmpty").classList.toggle("hidden", list.length > 0);
+  const ul = $("deviceList");
+  ul.textContent = "";
+  for (const rec of list) ul.appendChild(clipRow(rec, renderDeviceRecordings));
+}
+
+function clipRow(rec, refresh) {
+  const li = document.createElement("li");
+
+  const title = document.createElement("span");
+  title.className = "rtitle";
+  title.textContent = rec.title || "Untitled recording";
+  li.appendChild(title);
+
+  const meta = document.createElement("span");
+  meta.className = "rmeta";
+  meta.textContent = new Date(rec.createdAt).toLocaleString() + " · " + fmtBytes(rec.bytes);
+  li.appendChild(meta);
+
+  const watch = document.createElement("a");
+  watch.href = "/v/" + rec.id;
+  watch.textContent = "share";
+  li.appendChild(watch);
+
+  const manage = document.createElement("a");
+  manage.href = "/v/" + rec.id + (rec.token ? "?k=" + encodeURIComponent(rec.token) : "");
+  manage.textContent = "manage";
+  li.appendChild(manage);
+
+  const del = document.createElement("button");
+  del.className = "danger del";
+  del.textContent = "Delete";
+  del.onclick = () => deleteFromList(rec, refresh);
+  li.appendChild(del);
+
+  return li;
+}
+
+async function deleteFromList(rec, refresh) {
   if (!confirm("Delete “" + (rec.title || "Untitled recording") + "” for everyone with the link?")) return;
+  const headers = {};
+  if (signedIn()) headers.Authorization = "Bearer " + token();
+  else if (rec.token) headers.Authorization = "Bearer " + rec.token;
   try {
-    const res = await fetch("/api/clips/" + encodeURIComponent(rec.id), {
-      method: "DELETE",
-      headers: { Authorization: "Bearer " + rec.token }
-    });
+    const res = await fetch("/api/clips/" + encodeURIComponent(rec.id), { method: "DELETE", headers });
     if (res.status === 204 || res.status === 404) {
       saveRecordings(loadRecordings().filter((r) => r.id !== rec.id));
-      renderRecordings();
+      refresh();
+    } else if (res.status === 401) {
+      alert("Sign in to manage this clip (or use its manage link).");
     } else {
       alert("Deletion failed (" + res.status + "). Try the manage link.");
     }
@@ -563,7 +781,69 @@ async function deleteFromList(rec, li) {
   }
 }
 
+// --- export, delete everything ---------------------------------------------
+
+async function exportEverything() {
+  if (!signedIn()) return;
+  try {
+    const res = await fetch("/api/my/export", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      window.location = data.exportPath;
+    } else {
+      alert("Export failed (" + res.status + "). Try again.");
+    }
+  } catch {
+    alert("Export failed (network error). Try again.");
+  }
+}
+
+async function deleteEverything() {
+  if (!signedIn()) return;
+  if (!confirm("Delete every clip? Share links stop working for everyone — this cannot be undone.")) return;
+  try {
+    const res = await fetch("/api/my/clips", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      setStatus("setupStatus", "All your clips were deleted.", "ok");
+      await renderServerClips();
+    } else {
+      alert("Deletion failed (" + res.status + ").");
+    }
+  } catch {
+    alert("Deletion failed (network error).");
+  }
+}
+
+async function deleteAccount() {
+  if (!signedIn()) return;
+  if (!confirm("Delete your account and every clip? This cannot be undone.")) return;
+  try {
+    const res = await fetch("/api/my/account", {
+      method: "DELETE",
+      headers: { Authorization: "Bearer " + token() }
+    });
+    if (res.ok) {
+      storageRemove(TOKEN_KEY);
+      storageRemove(EMAIL_KEY);
+      setStatus("setupStatus", "Your account and all its clips were deleted.", "ok");
+      await refreshAccount();
+    } else {
+      alert("Account deletion failed (" + res.status + ").");
+    }
+  } catch {
+    alert("Account deletion failed (network error).");
+  }
+}
+
 // --- wiring ----------------------------------------------------------------
+
+let authMode = "signup";
 
 $("startBtn").onclick = startRecording;
 $("stopBtn").onclick = () => stopRecording(true);
@@ -588,6 +868,33 @@ $("localBtn").onclick = () => {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 };
 
+$("signInLink").onclick = () => {
+  authCardPinned = true;
+  setAuthMode("signin");
+  $("auth").classList.remove("hidden");
+  $("email").focus();
+};
+$("signOutLink").onclick = () => signOut();
+
+function setAuthMode(mode) {
+  authMode = mode;
+  $("authTitle").textContent = mode === "signup" ? "Sign up — it's free" : "Sign in";
+  $("authBtn").textContent = mode === "signup" ? "Create account" : "Sign in";
+  $("authSwitch").innerHTML = mode === "signup"
+    ? "Already recording here? <a id=\"authToggle\">Sign in</a>"
+    : "New here? <a id=\"authToggle\">Create a free account</a>";
+  document.getElementById("authToggle").onclick = () => setAuthMode(authMode === "signup" ? "signin" : "signup");
+  $("password").autocomplete = mode === "signup" ? "new-password" : "current-password";
+}
+
+$("authBtn").onclick = () => submitAuth(authMode);
+$("password").addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth(authMode); });
+$("email").addEventListener("keydown", (e) => { if (e.key === "Enter") $("password").focus(); });
+
+$("exportBtn").onclick = exportEverything;
+$("deleteAllBtn").onclick = deleteEverything;
+$("deleteAccountLink").onclick = (e) => { e.preventDefault(); deleteAccount(); };
+
 for (const btn of document.querySelectorAll("[data-copy]")) {
   btn.onclick = () => {
     const input = $(btn.dataset.copy);
@@ -606,7 +913,17 @@ window.addEventListener("beforeunload", (e) => {
   }
 });
 
-renderRecordings();
+(async () => {
+  try {
+    const res = await fetch("/api/limits");
+    if (res.ok) {
+      const data = await res.json();
+      limits = { maxClips: data.maxClips, maxDurationMs: data.maxDurationMs, maxClipBytes: data.maxClipBytes };
+    }
+  } catch { /* fall back to the defaults above */ }
+  setAuthMode("signup");
+  await refreshAccount();
+})();
 </script>
 </body>
 </html>
