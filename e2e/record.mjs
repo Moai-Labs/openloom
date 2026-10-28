@@ -98,11 +98,41 @@ async function fill(page, selector, value) {
   }, value);
 }
 
+const SUITE_PASSWORD = "correct horse battery";
+// the suite's fixed emails: a dev stack that ran the suite before still holds
+// them, and a full free account disables Start recording — so the run clears
+// them out before it starts (and again at the end)
+const SUITE_EMAILS = [
+  "author@example.com", "stranger@example.com", "successor@example.com",
+  "resultauthor@example.com", "resultnext@example.com",
+  "switchauthor@example.com", "switchnext@example.com",
+  "pendingowner@example.com", "afterpending@example.com"
+];
+
+async function removeSuiteAccounts(label = "cleared") {
+  for (const email of SUITE_EMAILS) {
+    try {
+      const login = await fetch(baseUrl + "/api/sessions", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password: SUITE_PASSWORD })
+      });
+      if (!login.ok) continue; // not ours (or not there): leave it alone
+      const { token } = await login.json();
+      const gone = await fetch(baseUrl + "/api/my/account", {
+        method: "DELETE", headers: { Authorization: "Bearer " + token }
+      });
+      console.log(`INFO  ${label} ${email}: ${gone.status}`);
+    } catch (err) {
+      console.log(`INFO  ${label} ${email} failed: ${err.message}`);
+    }
+  }
+}
+
 async function signUp(page, email) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   await page.waitForSelector("#auth:not(.hidden)", { timeout: 10000 });
   await fill(page, "#email", email);
-  await fill(page, "#password", "correct horse battery");
+  await fill(page, "#password", SUITE_PASSWORD);
   await page.click("#authBtn");
   const appeared = await page.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden"), { timeout: 5000 })
@@ -267,6 +297,11 @@ const PAGE_LEAKS_MANAGE_KEY = () =>
 async function main() {
   await startServerIfLocal();
   const browser = await puppeteer.launch({ headless: "shell", args: BROWSER_FLAGS });
+
+  // 0. a dev stack that ran this suite before still holds its fixed accounts,
+  // and a full free account disables Start recording: clear them first. Only
+  // accounts signed in with the suite's own password are removed.
+  await removeSuiteAccounts();
 
   const failures = [];
   const check = (name, ok, detail = "") => {
@@ -480,7 +515,7 @@ async function main() {
   check("signing out empties the clip list and its manage keys",
     signedOutState === true, JSON.stringify(signedOutState));
   await fill(switcher, "#email", "successor@example.com");
-  await fill(switcher, "#password", "correct horse battery");
+  await fill(switcher, "#password", SUITE_PASSWORD);
   await switcher.click("#authBtn");
   await switcher.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden")
@@ -498,7 +533,7 @@ async function main() {
   await switcher.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await switcher.click("#signInLink");
   await fill(switcher, "#email", "author@example.com");
-  await fill(switcher, "#password", "correct horse battery");
+  await fill(switcher, "#password", SUITE_PASSWORD);
   await switcher.click("#authBtn");
   await switcher.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await switcher.close();
@@ -526,7 +561,7 @@ async function main() {
     clearedResult.resultHidden && clearedResult.share === "" && clearedResult.manage === "" && !clearedResult.leak,
     JSON.stringify(clearedResult));
   await fill(resultPage, "#email", "resultnext@example.com");
-  await fill(resultPage, "#password", "correct horse battery");
+  await fill(resultPage, "#password", SUITE_PASSWORD);
   await resultPage.click("#authBtn");
   await resultPage.waitForFunction(() => !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   const successorCache = await resultPage.evaluate((tok) => ({
@@ -574,7 +609,7 @@ async function main() {
   await switchPage.click("#signOutLink");
   await switchPage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await fill(switchPage, "#email", "switchnext@example.com");
-  await fill(switchPage, "#password", "correct horse battery");
+  await fill(switchPage, "#password", SUITE_PASSWORD);
   await switchPage.click("#authBtn");
   await switchPage.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden")
@@ -656,7 +691,7 @@ async function main() {
   await stalePage.click("#signOutLink");
   await stalePage.waitForFunction(() => document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
   await fill(stalePage, "#email", "afterpending@example.com");
-  await fill(stalePage, "#password", "correct horse battery");
+  await fill(stalePage, "#password", SUITE_PASSWORD);
   await stalePage.click("#authBtn");
   await stalePage.waitForFunction(() =>
     !document.getElementById("whoami").classList.contains("hidden"), { timeout: 10000 });
@@ -906,6 +941,16 @@ async function main() {
   check("delete everything empties the list", emptied);
   const goneAfterPurge = (await fetch(baseUrl + new URL(shares[1]).pathname.replace("/v/", "/api/clips/"))).status;
   check("deleted clips stop playing for viewers", goneAfterPurge === 404, `meta now returns ${goneAfterPurge}`);
+
+  // 15. a shared dev stack keeps its own data: every fixed account the suite
+  // uses is signed in again by password and deleted, clips and all, so the
+  // run leaves nothing behind for anyone else using the stack. (Captured
+  // tokens are not enough here: the account-switch scenarios sign some of
+  // these accounts out mid-suite.) A local run's throwaway data directory is
+  // removed below anyway.
+  if (!dataDir) {
+    await removeSuiteAccounts("cleanup");
+  }
 
   await browser.close();
   if (child) child.kill();
