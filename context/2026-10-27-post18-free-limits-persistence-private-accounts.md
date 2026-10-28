@@ -180,3 +180,15 @@ this branch; decisions taken:
   to a timer tick *after* the cap — a legitimate 5-minute recording could be
   refused on its declared header. The prefilter now uses the same +2 s slop
   as the real (timeline) check.
+
+## Session (2026-10-28): re-verify and re-queue for review
+
+The review of 58bae54 could not be had last session and the post was paused;
+the platform has since re-taken it up. This session: merged origin/main
+(da4f51e, build-workflow/image-name changes — the only product-adjacent file
+is `.github/workflows/build.yml`, no product code changed) into post-18 at
+b6df32e, re-ran the full suite on the merged head — 33/33 pass. All four
+round-1 changes re-verified present in the source (accounts mutation queue
+with unique temp files and rollback; per-upload staging teardown; timeline
+scanner ignoring Info.Duration; account-scoped manage-key cache). Push
+re-queued so the merged head gets the review.
