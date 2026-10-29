@@ -228,8 +228,18 @@ async function createClip(req, res) {
         sendError(res, 413, `${tierName} stores clips up to ${Math.round(plan.maxDurationMs / 60000)} minutes — this one runs ${Math.round(verified / 60000)}`);
         return;
     }
-    // the timeline is the truth, even when the declared header disagrees
-    meta.durationMs = verified;
+    // Enforcement above reads the conservative scan. What the clip page
+    // displays is the shorter of that scan and the wall-clock length the
+    // recorder declared — the same number it patches into Info.Duration,
+    // so the text beside the player agrees with the player's own scrubber.
+    // The scan's trailing-gap fallback extrapolates the last frame's length
+    // from the gap to the block before it, and that overshoots a sparse
+    // recording: a 12-second capture of a still screen, its final frames
+    // seconds apart, was displayed as 15 seconds (post #72). A declared
+    // header longer than the scan is still overruled by the scan.
+    meta.durationMs = declaredDuration !== null && declaredDuration > 0 && declaredDuration < verified
+        ? declaredDuration
+        : verified;
     // and the file, not the request, says what it is — a webm sent as
     // video/mp4 is stored and served as a webm
     const docType = readWebmDocType(store.videoPath(meta.id));
