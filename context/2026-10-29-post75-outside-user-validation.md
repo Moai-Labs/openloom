@@ -21,10 +21,13 @@ passes". As of 2026-10-29 ~03:00 UTC that gate is **open**:
   due 29 October 18:00 UTC). If it fails or is missed, invitations pause
   per the post-62 plan.
 - The final deployed browser walk on the fixed revision (post #74) is
-  open: the preview still runs `f797f16` (verified by probing the
-  preview, which serves the pre-duration-fix revision), and the duration
-  fix sits unmerged on branch `post-74`. Post #74's own lane handles
-  that merge; this step only depends on its outcome.
+  open: the preview still runs `f797f16`, and the duration fix sits
+  unmerged on branch `post-74`. Verified here by my own behavioral probe
+  (2026-10-29 ~03:15 UTC): a test upload whose declared Duration (1000 ms)
+  is shorter than its timeline scan (8000 ms) was stored with
+  `durationMs` 8000 — the pre-fix behaviour — and the test clip and
+  account were deleted afterwards. Post #74's own lane handles that
+  merge; this step only depends on its outcome.
 
 While the gate is open: no new invitations, no recruiting beyond what
 the existing public ask already reached. If a participant arrives
