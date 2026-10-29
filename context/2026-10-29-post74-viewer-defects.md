@@ -17,10 +17,12 @@ the fix reached the public preview (no later than 20:34 UTC 2026-10-28,
 deploy 2d13f83; also in f797f16 deployed 21:31 UTC).
 
 **Verified fixed on the deployed revision.** Remote e2e run against the
-preview at f797f16 (2026-10-29, this session): 44 checks, all passed,
-including "viewer does not see a delete button" for a fresh logged-out
-session and "manage key shows a clickable delete button" for a real
-manage link; all nine run accounts cleaned up afterwards.
+preview (2026-10-28, prior session): 44 checks, all passed, including
+"viewer does not see a delete button" for a fresh logged-out session and
+"manage key shows a clickable delete button" for a real manage link; all
+nine run accounts cleaned up afterwards. Re-run 2026-10-29 (this
+session): 48 checks against the same deployed revision, all passed —
+full list in the acceptance table below.
 
 **New structural regression** (test/server.test.js): the served watch
 page must carry both the `class="danger hidden"` button and the
@@ -53,6 +55,13 @@ overshoot pinned down), and a declared header longer than the scan is
 overruled. API suite 95/95 local; browser e2e 50 checks local, all
 passed.
 
+**Confirmed on the deployed stack too:** the preview still serves the
+pre-fix revision — an uploaded sparse 12 s clip with a 3 s trailing gap
+displays `durationMs` 15000 there (probed 2026-10-29 via the API; the
+account and clip were deleted afterwards). The same fixture against the
+post-74 head locally reports 12000. The deployed display fix therefore
+lands only with the next deploy of this branch.
+
 **Residuals, stated plainly:**
 - Clips stored before this fix keep their stored durationMs; only new
   uploads display the corrected number.
@@ -69,10 +78,101 @@ passed.
 
 ## Acceptance state
 
-Delivery ≠ acceptance. The full user-flow walk (sign-up/login, record,
-logged-out viewing, playback, download, author deletion, second-account
-isolation) passed on the local post-74 revision and on the deployed
-f797f16 revision — but the deployed revision does not yet contain the
-duration fix, and the real desktop-Chrome screen-picker + microphone
-recording remains a human task. The final deployed walk of the merged
-revision is the next session's first job once the platform deploys it.
+Delivery ≠ acceptance. Recorded here per flow, per revision, no
+synthetic check dressed as a human one. Two revisions are in play:
+
+- **Local head** — post-74 at e8b7708 + this session's e2e anchor fix
+  (puppeteer Chrome 156, the product's own recording path with a
+  synthetic capture source substituted only where headless Chrome cannot
+  open the real picker).
+- **Deployed preview** — https://fl-dev-c108db22-0516-4540-b619-10c4a6bf1b9d.fly.dev,
+  serving revision f797f16 (verified empirically, not assumed: the
+  sparse-duration probe above returns 15000 there, 12000 on the local
+  head).
+
+### Synthetic browser walk — deployed preview, revision f797f16, 2026-10-29
+
+Full e2e suite, 48/48 checks passed, every run account deleted
+afterwards (the suite is built for the shared dev stack: per-run
+identities, finally-block cleanup):
+
+- Sign-up and sign-in (fresh creator); recording and save; a second
+  recording from the same page; share and manage links produced.
+- Startup races: repeated Start clicks start one capture flow; Start
+  disabled while startup is pending; capture ending mid-startup aborts
+  cleanly and releases the microphone; Start usable again after a
+  recorder error; a recorder error finalizes exactly once as a failure.
+- Dual-source recording (display audio + microphone mixed); clip
+  carries audio.
+- Free cap: usage meter 3 of 3, Start names the limit and refuses.
+- Second-account isolation: a second account's list is private and
+  empty; sign-out empties the list and manage keys; another creator on
+  the same browser sees none of the first creator's clips; an upload
+  finishing under a switched-in account shows none of the owner's
+  links and saves to the submitting account; stale completions leave
+  the successor's result alone; the successor can retry their own
+  recording.
+- Logged-out viewing: the share link plays for a fresh viewer with no
+  account; **no Delete button rendered for the viewer** (defect 1);
+  download is byte-identical to the recording with an attachment
+  filename.
+- Author deletion via the manage key from a fresh session; the deleted
+  link explains itself; export is a tar with manifest, meta and video.
+
+Reliability regressions against the same deployed preview, 11/11
+passed (2026-10-29, direct API with cleanup): over-cap declared
+duration refused; a 6-minute real timeline refused while the header
+claims 1 s; a BlockDuration stretching past the cap refused;
+parse-then-garbage refused with no partial duration; omitted-Duration
+6-minute timeline refused and an omitted-Duration 8-second one stored
+with its parsed 8000; random bytes refused; a webm-shaped file with no
+timeline refused (fail closed).
+
+Restart/restore: exercised on the local head only (backup → wipe →
+restore → playback, accounts survive — part of the 50/50 local e2e,
+twice this session). The deployed instance's data directory is not
+mine to wipe, and the remote e2e skips backup/restore there for that
+reason.
+
+### Local head, same session
+
+API suite 95/95; browser e2e 50/50 twice (the remote suite is the same
+suite minus the restore steps). The sparse-duration and
+scan-overrules-header regressions run here — they cannot pass on the
+deployed f797f16 revision, which is the marker that the deployed walk
+below is still owed.
+
+### Two harness defects found and what was done
+
+- The e2e's timer-freshness check anchored its clock after the
+  recording state appeared; a busy session between the page starting
+  the recording and the test stamping the anchor made the page look
+  falsely 1.6 s ahead and aborted one remote run. Anchors are now
+  stamped before the Start click — the recording cannot be older than
+  the click — which keeps the stale-timer regression's teeth while
+  removing the false positive.
+- Twice in four remote runs, the dual-audio step's recording finalized
+  with zero chunks and the page said "Nothing was recorded." (the
+  product's honest handling); the same step passed locally 3/3 and in
+  both subsequent remote runs. Suspected synthetic-source artifact
+  (canvas captureStream/AudioContext in the injected fake), not
+  observed on the real product path; the human screen-picker recording
+  below is the check that covers real capture.
+
+### Explicitly still unperformed
+
+1. **The deployed walk against the revision containing the duration
+   fix.** The platform deploys on merge, and the merge awaits review
+   approval — verified empirically above that the preview still serves
+   f797f16. The moment this branch is deployed, the same 48-check walk
+   plus the sparse-duration display check (a still-screen recording
+   must display its wall-clock length) runs against it and this record
+   is updated with that revision's hash. Until then the duration fix
+   is verified by the API regression and the local walk only.
+2. **The real desktop-Chrome screen-picker + microphone recording** —
+   a human task; headless Chrome cannot operate the picker. The
+   existing team requests on posts 17 and 61 (due 2026-10-29T18:00Z)
+   are reused unchanged; no duplicate was filed.
+3. **Restart/restore against the deployed instance** — covered on the
+   identical revision locally (above); wiping the deployed instance's
+   data is not something this session can do.
