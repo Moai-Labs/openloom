@@ -179,6 +179,11 @@ async function startRecordingOn(page, title, opts = {}) {
     // the microphone — both must be mixed into one track by the page
     await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
   }
+  // the test's own clock, stamped before the click: the recording cannot be
+  // older than the click that started it, and stamping only after the
+  // recording state appears would let a busy session between the two make
+  // the page's timer look falsely ahead of the test's clock
+  page.__recStartedAt = Date.now();
   await page.click("#startBtn");
   try {
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
@@ -187,13 +192,10 @@ async function startRecordingOn(page, title, opts = {}) {
     // headless Chrome often cannot open the real picker: inject a synthetic
     // capture source and record again
     await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+    page.__recStartedAt = Date.now(); // the second click is the real start
     await page.click("#startBtn");
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
   }
-  // the test's own clock at the moment this recording began — the anchor the
-  // timer freshness check below needs (a page under load can stall its main
-  // thread for seconds, but it cannot run ahead of this)
-  page.__recStartedAt = Date.now();
 }
 
 function withTimeout(promise, ms, message) {
@@ -208,6 +210,7 @@ function withTimeout(promise, ms, message) {
 async function recordOnPage(page, title, settleMs = 4000) {
   await page.goto(baseUrl + "/", { waitUntil: "networkidle0" });
   await fill(page, "#title", title);
+  page.__recStartedAt = Date.now(); // stamped before the click, as in startRecordingOn
   await page.click("#startBtn");
   try {
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
@@ -215,10 +218,10 @@ async function recordOnPage(page, title, settleMs = 4000) {
     // headless Chrome often cannot open the real picker: inject a synthetic
     // capture source and record again
     await page.evaluate(FAKE_GET_DISPLAY_MEDIA);
+    page.__recStartedAt = Date.now(); // the second click is the real start
     await page.click("#startBtn");
     await page.waitForSelector("#recording:not(.hidden)", { timeout: 8000 });
   }
-  page.__recStartedAt = Date.now(); // same anchor the timer check uses
   await new Promise((r) => setTimeout(r, settleMs));
   await page.click("#stopBtn");
 }

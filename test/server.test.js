@@ -481,6 +481,50 @@ test("the parser reads real durations from the media timeline", () => {
   assert.equal(readWebmDurationMs(Buffer.alloc(0)), null);
 });
 
+test("a sparse recording displays its declared length, not the trailing-gap extrapolation", async () => {
+  const { token } = await makeAccount("webmsparse@example.com");
+  // 12 s of timeline whose final frames sit seconds apart with no asserted
+  // frame duration — the shape of a real screen recording of a still
+  // screen. The scan's trailing-gap fallback measures it at 15 s, which is
+  // what the share page used to display (post #72); the recorder's wall
+  // clock said 12 s, the same number the player's scrubber shows.
+  const webm = webmFile({ spans: [[0, 0], [0, 9000], [0, 12000]] });
+  assert.equal(readWebmDurationMs(webm), 15000); // the overshoot, pinned down
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "12000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 201);
+  const clip = JSON.parse(res.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 12000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
+test("a declared header longer than the scan is still overruled by the scan", async () => {
+  const { token } = await makeAccount("webmlongdeclare@example.com");
+  // 8 s inside the file; the header inflates it to 20 s. Display follows
+  // the file, never the client that wants to look longer.
+  const webm = minimalWebm(8000, { declaredMs: 20000 });
+  const res = await request("POST", "/api/clips", {
+    body: webm,
+    headers: {
+      "content-type": "video/webm",
+      "x-duration-ms": "20000",
+      authorization: `Bearer ${token}`
+    }
+  });
+  assert.equal(res.status, 201);
+  const clip = JSON.parse(res.body);
+  const meta = JSON.parse((await request("GET", `/api/clips/${clip.id}`)).body);
+  assert.equal(meta.durationMs, 8000);
+  await request("DELETE", `/api/clips/${clip.id}`, { headers: { authorization: `Bearer ${clip.manageToken}` } });
+});
+
 test("an asserted BlockDuration counts in full, however long", () => {
   // a block at timestamp zero whose explicit BlockDuration says ten minutes:
   // the file's own word, and never to be discarded in favour of a shorter read
@@ -1343,6 +1387,16 @@ test("the patch script the recorder loads is served and wired in", async () => {
   // one definition now: the inline copies are gone from the page
   assert.ok(!page.body.toString().includes("function webmSizeVint"));
   assert.ok(!page.body.toString().includes("function patchWebmDuration"));
+});
+
+test("the watch page styles its hidden state — the Delete button cannot ship unstyled again", async () => {
+  // the original defect (post #72): the button carried the hidden class but
+  // the page carried no .hidden rule, so every viewer saw the control. The
+  // pair is asserted together so dropping either side fails here.
+  const page = await request("GET", "/v/whatever123");
+  const html = page.body.toString();
+  assert.match(html, /<button class="danger hidden" id="deleteBtn">/);
+  assert.match(html, /\.hidden\s*\{\s*display:\s*none\s*!important/);
 });
 
 // --- helpers ---------------------------------------------------------------
